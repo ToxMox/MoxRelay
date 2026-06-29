@@ -1,0 +1,22 @@
+{
+  "_comment": "MoxRelay source config (M2.2). Each entry: a registered libobs input id, a display name (also the {source} segment of the Spout sender name), and a 'settings' object passed verbatim as the source's obs_data settings. A monitor_capture entry without an explicit monitor_id is seeded with the primary display. The optional 'format' key selects the Spout sender pixel format -- srgb87 (default; sRGB-encoded bytes), linear87 (linear bytes, for receivers that perform no sRGB decode), or fp16 (linear half-float HDR). Full config management/persistence arrives in M6.",
+  "port": 7341,
+  "sources": [
+    {
+      "id": "monitor_capture",
+      "name": "Desktop",
+      "settings": { "method": 0, "capture_cursor": true }
+    },
+    {
+      "id": "color_source_v3",
+      "name": "ColorA",
+      "settings": { "color": 4280303808, "width": 640, "height": 360 }
+    },
+    {
+      "id": "color_source_v3",
+      "name": "ColorB",
+      "settings": { "color": 4278255360, "width": 320, "height": 240 },
+      "format": "srgb87"
+    }
+  ]
+}

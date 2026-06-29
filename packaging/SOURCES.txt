@@ -1,0 +1,107 @@
+===============================================================================
+CORRESPONDING SOURCE / WRITTEN OFFER (GNU GPL)
+===============================================================================
+
+RELEASE-PINNED DOCUMENT: the component versions/commits/build identifiers below
+correspond to THIS exact build (0.19.0-m13). They must be regenerated/updated on
+every release so the pinned source always matches the binary being shipped.
+
+This software is licensed under the GNU General Public License, version 3 or
+(at your option) any later version. The full text of that license is the
+LICENSE file that ships at the root of this package.
+
+This binary is built from, and statically and/or dynamically incorporates,
+several components that are themselves licensed under the GNU GPL (GPLv2) or
+the GNU LGPL. Because GPL-licensed components are combined into the program,
+the work as a whole is conveyed under the GPL.
+
+CORRESPONDING SOURCE -- PRIMARY MECHANISM (GPLv3 section 6(d))
+The complete corresponding source code for this application is publicly
+available, at no charge, from a network server:
+
+    https://github.com/ToxMox/MoxRelay
+
+at the tag/release matching this build's version (0.19.0-m13). Equivalent
+access to the source is offered from this same public location as the binary
+itself, which satisfies GPLv3 section 6(d). That repository, together with the
+upstream per-component sources pinned in the list below, constitutes the
+complete corresponding source for the GPL/LGPL portions of this binary.
+
+A full per-component license index, including the components that are NOT
+under the GPL, is in THIRD-PARTY-NOTICES.txt (next to this file), with the
+verbatim license texts under the licenses/ directory.
+
+
+-------------------------------------------------------------------------------
+GPL / LGPL COMPONENTS AND THEIR CORRESPONDING SOURCE
+-------------------------------------------------------------------------------
+
+The exact upstream revision pinned in this build is listed for each component.
+Together these constitute the complete corresponding source for the GPL/LGPL
+portions of this binary.
+
+1. This application
+   License : GPLv3-or-later (see the root LICENSE file)
+   Version : 0.19.0-m13   (matches this package's version / zip file name)
+   Source  : https://github.com/ToxMox/MoxRelay
+             The public source repository at the release tag matching the
+             version above IS the corresponding source for this application.
+
+2. OBS Studio / libobs  (core capture, rendering and media engine)
+   License : GPLv2-or-later  (licenses/libobs/COPYING)
+   Version : 32.1.2
+   Commit  : fb4d98bf88fae5fc85cb11fc57f7c5e309282194
+   Source  : https://github.com/obsproject/obs-studio
+             (checkout tag 32.1.2 / the commit above)
+
+3. Bundled OBS plugins  (shipped under obs-plugins/)
+   License : GPLv2-or-later, part of OBS Studio (licenses/libobs/COPYING)
+   Plugins : image-source, obs-ffmpeg, obs-filters, obs-text,
+             win-capture, win-dshow, win-wasapi
+   Source  : Same repository, tag and commit as OBS Studio above
+             (https://github.com/obsproject/obs-studio, tag 32.1.2).
+
+4. OBS prebuilt dependencies  (the upstream dependency bundle that supplies
+   the FFmpeg, x264, curl, librist, libsrt, libdatachannel, LuaJIT and zlib
+   binaries redistributed here)
+   Build   : obs-deps 2025-08-23  (dir name: obs-deps-2025-08-23)
+   Source  : https://github.com/obsproject/obs-deps
+             (the build recipe at the 2025-08-23 release)
+
+5. FFmpeg  (GPL build)
+   License : GPLv2-or-later  (licenses/FFmpeg/COPYING.GPLv2)
+   Version : n7.1.1   (GPL-enabled build, as shipped in obs-deps 2025-08-23)
+   Source  : https://git.ffmpeg.org/ffmpeg.git  (tag n7.1.1)
+             https://ffmpeg.org/download.html
+
+6. x264  (GPL build)
+   License : GPLv2-or-later  (licenses/x264/COPYING)
+   Version : 0.164.r3106   (commit eaa68fa, X264_GPL=1; in obs-deps 2025-08-23)
+   Source  : https://code.videolan.org/videolan/x264  (commit eaa68fa)
+             https://www.videolan.org/developers/x264.html
+
+
+-------------------------------------------------------------------------------
+THREE-YEAR WRITTEN OFFER (SECONDARY FALLBACK)
+-------------------------------------------------------------------------------
+
+The primary mechanism above (public network access under GPLv3 section 6(d))
+is the normal way to obtain the corresponding source, and in nearly all cases
+is the fastest route. This written offer is a fallback that applies only if a
+copy of this binary is ever distributed at a time when the public repository
+at https://github.com/ToxMox/MoxRelay is private or otherwise unavailable.
+
+In that event, for a period of three (3) years from the date you received the
+binary, the distributor will, on request, provide a complete machine-readable
+copy of the corresponding source code for the GPL- and LGPL-licensed
+components listed above, on a medium customarily used for software interchange,
+for a charge no more than the cost of physically performing the source
+distribution. This offer is valid to any third party who possesses the binary.
+
+To request the source under this fallback offer, or for any questions about
+the corresponding source, open an issue at:
+
+    https://github.com/ToxMox/MoxRelay/issues
+
+When making a request, please reference the version (0.19.0-m13) and the
+specific component(s) whose source you require.

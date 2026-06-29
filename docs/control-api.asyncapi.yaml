@@ -1,0 +1,3695 @@
+# MoxRelay Control API -- AsyncAPI 3.0 contract.
+# Hand-authored; this document is the source of truth for the wire protocol.
+# Validate with:  npx -y @asyncapi/cli validate MoxRelay/docs/control-api.asyncapi.yaml
+asyncapi: 3.0.0
+x-apiVersion: 1 # control-protocol version (matches GetVersion.result.apiVersion)
+
+info:
+  title: MoxRelay Control API
+  version: 1.11.0
+  license:
+    name: GPL-3.0
+    url: https://www.gnu.org/licenses/gpl-3.0.html
+  description: |
+    Loopback WebSocket + JSON control protocol for a MoxRelay capture instance.
+
+    MoxRelay captures video/audio sources and emits each source as its own Spout
+    sender. A running MoxRelay process is one *instance* and **serves its own
+    control endpoint** at `ws://127.0.0.1:{port}/control`. All control traffic is
+    text frames carrying JSON. The endpoint binds loopback only -- it is a local
+    control surface, not a network service. TLS is not used.
+
+    ### Discovery handshake
+    Clients discover the instance via the discovery file
+    `%APPDATA%/MoxRelay/helper-config.json` (a bare single-instance object):
+
+    ```json
+    {"instanceId":"tier-60","port":7341,"version":"0.17.0-m11",
+     "fpsTier":60,"spoutPrefix":"MACHINE:Helper_7341",
+     "ownerId":"","controlToken":"a3f81c0e7d2b49f6a3f81c0e7d2b49f6",
+     "sources":[{"name":"MACHINE:Helper_7341_Desktop"}]}
+    ```
+
+    Read `port`, then connect to `ws://127.0.0.1:{port}/control`. Notes on the
+    discovery file:
+    - `sources[].name` entries are the ACTUAL registered Spout sender names
+      (collision-suffixed when needed, e.g. `_2`); bind them verbatim.
+    - `controlToken` (string): a per-launch random token the helper generates at
+      start. Clients MUST append it as `?token=<controlToken>` to the WebSocket
+      upgrade URI (see the `instance` server description). It changes on every
+      helper launch -- read it fresh from the file before each connect. Absent
+      only against a pre-1.7.0 (token-less) helper.
+    - The file is written atomically and rewritten on change (~1 s cadence). The
+      `controlToken` is written atomically with `port` (same temp+rename), so a
+      reader never sees a port without its matching token.
+    - A clean shutdown writes a bare empty object `{}`; a crash leaves stale
+      content. The file is a discovery HINT; this control API is the
+      authoritative live state. Clients should additionally validate sender
+      liveness through Spout itself before trusting a name.
+    - The discovery file location can be overridden at launch with
+      `--discovery-path <file>` (default: `%APPDATA%/MoxRelay/helper-config.json`).
+
+    As of contract 1.5.2, a `CreateSourceParams.externalId` string (a
+    client-supplied stable identifier, opaque to the helper) is stored verbatim
+    and echoed back in SourceSummary, so a control client can re-adopt the same
+    logical source across restarts. Absent == no echoed externalId (legacy
+    behavior).
+
+    As of contract 1.7.0, the WebSocket upgrade is AUTHENTICATED and
+    browser-fenced. Two gates run on the upgrade handshake, BEFORE any verb is
+    dispatched:
+    - TOKEN: the upgrade request-target MUST carry `?token=<controlToken>`
+      matching the instance's `controlToken` from helper-config.json
+      (the file's `controlToken` field). A missing or wrong token is rejected with
+      WS close code 4401 (no connection, no verb). The compare is constant-time.
+    - ORIGIN: an upgrade is rejected with WS close code 4403 if it carries a
+      browser-style `Origin` header -- an http/https scheme, a non-loopback host,
+      or the literal `null`. An upgrade with NO `Origin` header, or with a
+      `ws(s)://` loopback self-origin (host `127.0.0.1`, `localhost`, or `::1`),
+      is allowed: a browser can never forge such an origin (it always sends its
+      page's http/https origin or `null`), so this still fences out every web
+      page while admitting native clients. Native WebSocket clients typically send
+      no `Origin` header; some native WebSocket libraries send a default
+      `ws://127.0.0.1:{port}` origin, which is accepted. The token gate (above)
+      applies independently of the Origin check.
+    This is a DELIBERATE minor bump for a behaviorally breaking handshake change,
+    NOT an oversight: a pre-1.7.0 third-party client that connected with no token
+    is now rejected and MUST be updated to read `controlToken` from the discovery
+    file and append `?token=` (see "Third-party client impact" below). The token
+    is fully automatic (helper-generated, rotates per launch); there is no user
+    prompt, flag, or env var. An empty `controlToken` (only on the helper's own
+    CSPRNG failure) disables the token gate for that instance (degraded, logged);
+    the Origin check still applies.
+
+    ### Third-party client impact (contract 1.7.0, breaking)
+    A pre-1.7.0 client that connected with a plain `ws://127.0.0.1:{port}/control`
+    URL and no token is REJECTED by a 0.12.0-m8+ helper (close 4401). To work
+    against a 1.7.0 helper a client MUST:
+    1. read `controlToken` from the discovery file (the same file it already
+       reads `port` from);
+    2. append `?token=<controlToken>` to every connect URL;
+    3. send NO `Origin` header.
+    Re-read the file before each fresh connection (the token rotates per launch).
+    This breaking handshake behavior is exactly why the version is bumped to
+    1.7.0 (minor), not a 1.6.x patch.
+
+    ### Wire framing (apiVersion 1)
+    - Request:  `{"id": <int|string>, "method": "<Verb>", "params": {...}}` --
+      `id` is client-chosen and echoed verbatim; `params` may be omitted
+      (treated as `{}`).
+    - Success:  `{"id": <echoed>, "result": {...}}`
+    - Error:    `{"id": <echoed>, "error": {"code": <int>, "message": "...", "data": {...}?}}`
+    - Server push: `{"event": "<name>", "data": {...}}` -- **no `id` field**.
+      Clients demultiplex purely on the absence of `id`. Pushes may interleave
+      with replies on the same socket.
+    - Method names are PascalCase (`CreateSource`); all field names and event
+      names are camelCase.
+    - Each request receives exactly one reply (success or error). Requests on
+      one connection are processed in order.
+
+    Operations below are described from the SERVER's perspective: a client
+    request is an action the server `receive`s and answers via `reply`;
+    server-pushed events are `send`.
+
+    ### Error codes
+    Protocol errors (negative, fixed):
+
+    | Code | Meaning |
+    |-|-|
+    | -32700 | Parse error (invalid JSON) |
+    | -32600 | Invalid request (missing/invalid `method`) |
+    | -32601 | Method not found |
+    | -32602 | Invalid params |
+
+    Application errors (positive 1000-range; `error.data` carries
+    `{category, sourceId?, filterId?, property?, detail?}`):
+
+    | Code | Name | Meaning |
+    |-|-|-|
+    | 1001 | SourceNotFound | `sourceId` does not exist on this instance |
+    | 1002 | FilterNotFound | `filterId` does not exist on that source |
+    | 1003 | SourceTypeUnavailable | unknown/unsupported source `type` |
+    | 1004 | FilterTypeUnavailable | unknown `filterType`, or filter kind not applicable to the source |
+    | 1005 | DeviceBusy | device open failed (e.g. exclusive device held by another process) |
+    | 1006 | InvalidPropertyValue | a settings key/value was rejected |
+    | 1007 | NotImplemented | the method exists in the contract but is not available in this build |
+    | 1008 | NotReady | mutating request received while the instance is still starting |
+    | 1009 | ShuttingDown | request received during instance teardown |
+    | 1010 | SourceCreateFailed | the engine failed to create the source |
+    | 1011 | BroadcastStateConflict | broadcast state transition could not be applied |
+    | 1012 | MediaNotSupported | the source does not support media transport (no media pipeline -- today only `media` sources), or the specific action is unsupported (e.g. seeking media with no known duration) |
+
+    Every verb may also reply with `-32602` on malformed params. `-32601` is
+    reserved for genuinely unknown method names; methods defined here but not
+    yet implemented return `1007 NotImplemented` instead.
+
+    ### Identity model
+    Sources are identified by a server-generated opaque string `sourceId`,
+    returned by `CreateSource` and listed by `ListSources`/`GetStatus`. It is
+    stable for the source's lifetime within the instance and never reused while
+    the instance runs. `displayName` is a human-readable label and is NOT
+    unique. The Spout sender name (`senderName`) is a separate, read-only,
+    server-owned field: it is resolved by the engine only after the source's
+    first transmitted frame and may be collision-suffixed; it is `null` until
+    resolved. Clients must bind receivers to `senderName` exactly as returned
+    (the `senderNameResolved` event signals availability), never to a name they
+    predicted. Filters are identified the same way by `filterId`, scoped to
+    their source.
+
+    ### Persistence semantics
+    Sources created at runtime via `CreateSource` are EPHEMERAL: they do not
+    survive an instance restart, and `RemoveSource` affects only the running
+    instance. The same applies to filters and property changes applied at
+    runtime. A future contract revision may add an opt-in persistence flag.
+
+    ### Subscriptions, events, reconnect
+    Server pushes are opt-in per event name via `Subscribe`; the ack's
+    `subscribed` array lists the names NEWLY added to this connection's
+    subscription set (already-subscribed, unknown, or unsupported names are
+    silently omitted). `Unsubscribe` is symmetric. The
+    `instanceShuttingDown` event is the one exception: it is delivered to every
+    connected client regardless of subscription. The subscription set is
+    per-connection and the server keeps no session across sockets: after a
+    reconnect, clients MUST re-issue `GetVersion`, re-`Subscribe`, and
+    re-snapshot state via `ListSources` + `GetStatus`. There is no event replay.
+
+    ### Vocabulary
+    All verbs, type names, and the primary payload fields are MoxRelay's own
+    high-level vocabulary (the friendly source types
+    camera/display/window/...). The one deliberate exception is the diagnostic
+    `engineId` field on `EnumerateSourceVariants`, which reports the underlying
+    libobs capture-engine source id (e.g. `dshow_input`, `monitor_capture`)
+    for that type; libobs is a disclosed build dependency. No host-application
+    or product names appear on the wire. Source types and filter types are
+    closed sets advertised at runtime
+    by `GetVersion` capabilities, `ListSourceTypes` (per-type display labels +
+    capability flags), and `ListAvailableFilters`; settings keys are
+    discovered through the property-descriptor verbs (`ListSourceProperties`,
+    `ListFilterProperties`) and are part of this published contract.
+
+defaultContentType: application/json
+
+servers:
+  instance:
+    host: '127.0.0.1:{port}'
+    pathname: /control
+    protocol: ws
+    description: >-
+      The MoxRelay instance. Loopback only; plain WebSocket upgrade (GET), no
+      TLS. As of contract 1.7.0 the upgrade is AUTHENTICATED: the request-target
+      MUST carry `?token=<controlToken>` matching this instance's per-launch
+      `controlToken` from helper-config.json -- e.g.
+      `ws://127.0.0.1:7341/control?token=a3f8...`. A missing/wrong token is
+      rejected with WS close 4401; an upgrade carrying a browser-style `Origin`
+      (http/https scheme, non-loopback host, or `null`) is rejected with WS close
+      4403 (browser fence). No `Origin`, or a `ws(s)://`-loopback self-origin, is
+      allowed. Send no `Origin` header. The
+      `{port}` value is a template: the authoritative port (and token) comes from
+      `%APPDATA%/MoxRelay/helper-config.json` -> `port` / `controlToken`.
+      Never hard-code a port or token; both rotate.
+      (The `?token=` query is documented in prose here rather than as a server
+      variable: AsyncAPI 3.0 URL templating with a query parameter trips some
+      validators.)
+    variables:
+      port:
+        default: '7341'
+        description: >-
+          TCP port of THIS instance's control endpoint (illustrative default;
+          always resolve via the discovery file).
+
+channels:
+  control:
+    address: /control
+    description: >-
+      Single bidirectional control socket per instance. Carries all requests,
+      replies, and server-pushed events. Replies echo the request `id`;
+      pushes have no `id`.
+    bindings:
+      ws:
+        bindingVersion: 0.1.0
+    messages:
+      GetVersionRequest: { $ref: '#/components/messages/GetVersionRequest' }
+      GetVersionReply: { $ref: '#/components/messages/GetVersionReply' }
+      GetStatusRequest: { $ref: '#/components/messages/GetStatusRequest' }
+      GetStatusReply: { $ref: '#/components/messages/GetStatusReply' }
+      ListSourcesRequest: { $ref: '#/components/messages/ListSourcesRequest' }
+      ListSourcesReply: { $ref: '#/components/messages/ListSourcesReply' }
+      ListSourceTypesRequest: { $ref: '#/components/messages/ListSourceTypesRequest' }
+      ListSourceTypesReply: { $ref: '#/components/messages/ListSourceTypesReply' }
+      CreateSourceRequest: { $ref: '#/components/messages/CreateSourceRequest' }
+      CreateSourceReply: { $ref: '#/components/messages/CreateSourceReply' }
+      RemoveSourceRequest: { $ref: '#/components/messages/RemoveSourceRequest' }
+      RemoveSourceReply: { $ref: '#/components/messages/RemoveSourceReply' }
+      SetSourcePropertiesRequest: { $ref: '#/components/messages/SetSourcePropertiesRequest' }
+      SetSourcePropertiesReply: { $ref: '#/components/messages/SetSourcePropertiesReply' }
+      ListSourcePropertiesRequest: { $ref: '#/components/messages/ListSourcePropertiesRequest' }
+      ListSourcePropertiesReply: { $ref: '#/components/messages/ListSourcePropertiesReply' }
+      EnumerateSourceVariantsRequest: { $ref: '#/components/messages/EnumerateSourceVariantsRequest' }
+      EnumerateSourceVariantsReply: { $ref: '#/components/messages/EnumerateSourceVariantsReply' }
+      ListAvailableFiltersRequest: { $ref: '#/components/messages/ListAvailableFiltersRequest' }
+      ListAvailableFiltersReply: { $ref: '#/components/messages/ListAvailableFiltersReply' }
+      AddFilterRequest: { $ref: '#/components/messages/AddFilterRequest' }
+      AddFilterReply: { $ref: '#/components/messages/AddFilterReply' }
+      RemoveFilterRequest: { $ref: '#/components/messages/RemoveFilterRequest' }
+      RemoveFilterReply: { $ref: '#/components/messages/RemoveFilterReply' }
+      SetFilterPropertiesRequest: { $ref: '#/components/messages/SetFilterPropertiesRequest' }
+      SetFilterPropertiesReply: { $ref: '#/components/messages/SetFilterPropertiesReply' }
+      ListFilterPropertiesRequest: { $ref: '#/components/messages/ListFilterPropertiesRequest' }
+      ListFilterPropertiesReply: { $ref: '#/components/messages/ListFilterPropertiesReply' }
+      ListFiltersRequest: { $ref: '#/components/messages/ListFiltersRequest' }
+      ListFiltersReply: { $ref: '#/components/messages/ListFiltersReply' }
+      SetFilterEnabledRequest: { $ref: '#/components/messages/SetFilterEnabledRequest' }
+      SetFilterEnabledReply: { $ref: '#/components/messages/SetFilterEnabledReply' }
+      ReorderFilterRequest: { $ref: '#/components/messages/ReorderFilterRequest' }
+      ReorderFilterReply: { $ref: '#/components/messages/ReorderFilterReply' }
+      SetFilterNameRequest: { $ref: '#/components/messages/SetFilterNameRequest' }
+      SetFilterNameReply: { $ref: '#/components/messages/SetFilterNameReply' }
+      InvokeSourceButtonRequest: { $ref: '#/components/messages/InvokeSourceButtonRequest' }
+      InvokeSourceButtonReply: { $ref: '#/components/messages/InvokeSourceButtonReply' }
+      ListAudioDevicesRequest: { $ref: '#/components/messages/ListAudioDevicesRequest' }
+      ListAudioDevicesReply: { $ref: '#/components/messages/ListAudioDevicesReply' }
+      SetAudioOutputDeviceRequest: { $ref: '#/components/messages/SetAudioOutputDeviceRequest' }
+      SetAudioOutputDeviceReply: { $ref: '#/components/messages/SetAudioOutputDeviceReply' }
+      StartBroadcastRequest: { $ref: '#/components/messages/StartBroadcastRequest' }
+      StartBroadcastReply: { $ref: '#/components/messages/StartBroadcastReply' }
+      StopBroadcastRequest: { $ref: '#/components/messages/StopBroadcastRequest' }
+      StopBroadcastReply: { $ref: '#/components/messages/StopBroadcastReply' }
+      SetSourceIdleModeRequest: { $ref: '#/components/messages/SetSourceIdleModeRequest' }
+      SetSourceIdleModeReply: { $ref: '#/components/messages/SetSourceIdleModeReply' }
+      SetSourceFormatRequest: { $ref: '#/components/messages/SetSourceFormatRequest' }
+      SetSourceFormatReply: { $ref: '#/components/messages/SetSourceFormatReply' }
+      GetMediaStatusRequest: { $ref: '#/components/messages/GetMediaStatusRequest' }
+      GetMediaStatusReply: { $ref: '#/components/messages/GetMediaStatusReply' }
+      ControlMediaRequest: { $ref: '#/components/messages/ControlMediaRequest' }
+      ControlMediaReply: { $ref: '#/components/messages/ControlMediaReply' }
+      SeekMediaRequest: { $ref: '#/components/messages/SeekMediaRequest' }
+      SeekMediaReply: { $ref: '#/components/messages/SeekMediaReply' }
+      GetSourceAudioRequest: { $ref: '#/components/messages/GetSourceAudioRequest' }
+      GetSourceAudioReply: { $ref: '#/components/messages/GetSourceAudioReply' }
+      SetSourceAudioRequest: { $ref: '#/components/messages/SetSourceAudioRequest' }
+      SetSourceAudioReply: { $ref: '#/components/messages/SetSourceAudioReply' }
+      SubscribeRequest: { $ref: '#/components/messages/SubscribeRequest' }
+      SubscribeReply: { $ref: '#/components/messages/SubscribeReply' }
+      UnsubscribeRequest: { $ref: '#/components/messages/UnsubscribeRequest' }
+      UnsubscribeReply: { $ref: '#/components/messages/UnsubscribeReply' }
+      StatusEvent: { $ref: '#/components/messages/StatusEvent' }
+      SourceAddedEvent: { $ref: '#/components/messages/SourceAddedEvent' }
+      SourceRemovedEvent: { $ref: '#/components/messages/SourceRemovedEvent' }
+      SenderNameResolvedEvent: { $ref: '#/components/messages/SenderNameResolvedEvent' }
+      BroadcastChangedEvent: { $ref: '#/components/messages/BroadcastChangedEvent' }
+      FilterAddedEvent: { $ref: '#/components/messages/FilterAddedEvent' }
+      FilterRemovedEvent: { $ref: '#/components/messages/FilterRemovedEvent' }
+      FilterChangedEvent: { $ref: '#/components/messages/FilterChangedEvent' }
+      PropertyChangedEvent: { $ref: '#/components/messages/PropertyChangedEvent' }
+      MediaChangedEvent: { $ref: '#/components/messages/MediaChangedEvent' }
+      AudioChangedEvent: { $ref: '#/components/messages/AudioChangedEvent' }
+      AudioLevelsEvent: { $ref: '#/components/messages/AudioLevelsEvent' }
+      SourceIdleModeChangedEvent: { $ref: '#/components/messages/SourceIdleModeChangedEvent' }
+      InstanceShuttingDownEvent: { $ref: '#/components/messages/InstanceShuttingDownEvent' }
+      ShutdownRequest: { $ref: '#/components/messages/ShutdownRequest' }
+      ShutdownReply: { $ref: '#/components/messages/ShutdownReply' }
+      ListProfilesRequest: { $ref: '#/components/messages/ListProfilesRequest' }
+      ListProfilesReply: { $ref: '#/components/messages/ListProfilesReply' }
+      LoadProfileRequest: { $ref: '#/components/messages/LoadProfileRequest' }
+      LoadProfileReply: { $ref: '#/components/messages/LoadProfileReply' }
+      SaveProfileRequest: { $ref: '#/components/messages/SaveProfileRequest' }
+      SaveProfileReply: { $ref: '#/components/messages/SaveProfileReply' }
+      DeleteProfileRequest: { $ref: '#/components/messages/DeleteProfileRequest' }
+      DeleteProfileReply: { $ref: '#/components/messages/DeleteProfileReply' }
+
+operations:
+  getVersion:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Version and capability handshake (call first after connecting).
+    messages:
+      - $ref: '#/channels/control/messages/GetVersionRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/GetVersionReply'
+  getStatus:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Full live snapshot of THIS instance.
+    messages:
+      - $ref: '#/channels/control/messages/GetStatusRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/GetStatusReply'
+  listSources:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: List this instance's sources.
+    messages:
+      - $ref: '#/channels/control/messages/ListSourcesRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ListSourcesReply'
+  listSourceTypes:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Enumerate the source types this instance can create.
+    messages:
+      - $ref: '#/channels/control/messages/ListSourceTypesRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ListSourceTypesReply'
+  createSource:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Create a source at runtime (ephemeral; see persistence semantics).
+    messages:
+      - $ref: '#/channels/control/messages/CreateSourceRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/CreateSourceReply'
+  removeSource:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Remove a source from the running instance.
+    messages:
+      - $ref: '#/channels/control/messages/RemoveSourceRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/RemoveSourceReply'
+  setSourceProperties:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Apply a partial settings update to a source.
+    messages:
+      - $ref: '#/channels/control/messages/SetSourcePropertiesRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SetSourcePropertiesReply'
+  listSourceProperties:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Property descriptors + current settings of a source.
+    messages:
+      - $ref: '#/channels/control/messages/ListSourcePropertiesRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ListSourcePropertiesReply'
+  enumerateSourceVariants:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Enumerate a source TYPE's option dependency tree without a live source (non-mutating).
+    messages:
+      - $ref: '#/channels/control/messages/EnumerateSourceVariantsRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/EnumerateSourceVariantsReply'
+  listAvailableFilters:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Enumerate filter types this instance can add.
+    messages:
+      - $ref: '#/channels/control/messages/ListAvailableFiltersRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ListAvailableFiltersReply'
+  addFilter:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Add a filter to a source.
+    messages:
+      - $ref: '#/channels/control/messages/AddFilterRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/AddFilterReply'
+  removeFilter:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Remove a filter from a source.
+    messages:
+      - $ref: '#/channels/control/messages/RemoveFilterRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/RemoveFilterReply'
+  setFilterProperties:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Apply a partial settings update to a filter.
+    messages:
+      - $ref: '#/channels/control/messages/SetFilterPropertiesRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SetFilterPropertiesReply'
+  listFilterProperties:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Property descriptors + current settings of a filter.
+    messages:
+      - $ref: '#/channels/control/messages/ListFilterPropertiesRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ListFilterPropertiesReply'
+  listFilters:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: List a source's filter chain in order.
+    messages:
+      - $ref: '#/channels/control/messages/ListFiltersRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ListFiltersReply'
+  setFilterEnabled:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Enable or disable a filter without removing it.
+    messages:
+      - $ref: '#/channels/control/messages/SetFilterEnabledRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SetFilterEnabledReply'
+  reorderFilter:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Move a filter to a new position in its source's chain.
+    messages:
+      - $ref: '#/channels/control/messages/ReorderFilterRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ReorderFilterReply'
+  setFilterName:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Rename a filter's display label.
+    messages:
+      - $ref: '#/channels/control/messages/SetFilterNameRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SetFilterNameReply'
+  invokeSourceButton:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Invoke a button property on a source or one of its filters.
+    messages:
+      - $ref: '#/channels/control/messages/InvokeSourceButtonRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/InvokeSourceButtonReply'
+  listAudioDevices:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Enumerate system audio endpoints (WASAPI).
+    messages:
+      - $ref: '#/channels/control/messages/ListAudioDevicesRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ListAudioDevicesReply'
+  setAudioOutputDevice:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Select the output device for this instance's mixed audio.
+    messages:
+      - $ref: '#/channels/control/messages/SetAudioOutputDeviceRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SetAudioOutputDeviceReply'
+  startBroadcast:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Start sending (all sources, or a named subset).
+    messages:
+      - $ref: '#/channels/control/messages/StartBroadcastRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/StartBroadcastReply'
+  stopBroadcast:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Stop sending (all sources, or a named subset).
+    messages:
+      - $ref: '#/channels/control/messages/StopBroadcastRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/StopBroadcastReply'
+  setSourceIdleMode:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: >-
+      Set a source's idle device-release mode. When releaseWhenIdle is true the helper
+      releases the exclusive capture device while the source has no broadcast consumer,
+      reacquiring it on the next StartBroadcast. Behaviorally observable only on
+      device-holding types (camera, audio input/output); a recorded no-op otherwise.
+    messages:
+      - $ref: '#/channels/control/messages/SetSourceIdleModeRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SetSourceIdleModeReply'
+  setSourceFormat:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Change the pixel format a source's Spout sender emits.
+    messages:
+      - $ref: '#/channels/control/messages/SetSourceFormatRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SetSourceFormatReply'
+  getMediaStatus:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Media transport snapshot of a media-capable source.
+    messages:
+      - $ref: '#/channels/control/messages/GetMediaStatusRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/GetMediaStatusReply'
+  controlMedia:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Drive playback (play / pause / restart / stop).
+    messages:
+      - $ref: '#/channels/control/messages/ControlMediaRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ControlMediaReply'
+  seekMedia:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Seek to a position (known-duration media only).
+    messages:
+      - $ref: '#/channels/control/messages/SeekMediaRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SeekMediaReply'
+  getSourceAudio:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Per-source audio state (gain, muted, balance, syncOffsetMs).
+    messages:
+      - $ref: '#/channels/control/messages/GetSourceAudioRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/GetSourceAudioReply'
+  setSourceAudio:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Update a source's audio state (gain / muted / balance / syncOffsetMs).
+    messages:
+      - $ref: '#/channels/control/messages/SetSourceAudioRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SetSourceAudioReply'
+  subscribe:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Opt in to server-pushed events on this connection.
+    messages:
+      - $ref: '#/channels/control/messages/SubscribeRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SubscribeReply'
+  unsubscribe:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: Opt out of server-pushed events on this connection.
+    messages:
+      - $ref: '#/channels/control/messages/UnsubscribeRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/UnsubscribeReply'
+  shutdown:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: >-
+      Request a clean exit of THIS instance. Idempotent: a repeated Shutdown
+      while already stopping returns a re-ack (alreadyStopping=true), never the
+      1009 ShuttingDown error. The reply is sent before the process exits; the
+      instanceShuttingDown event then follows on the wire.
+    messages:
+      - $ref: '#/channels/control/messages/ShutdownRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ShutdownReply'
+  listProfiles:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: >-
+      List this instance's saved scene profiles (STANDALONE only). Rejects with
+      1013 ProfilesUnavailable when the instance was launched owned (managed
+      mode), where the owning integrator is the single source of truth and
+      profiles are inert.
+    messages:
+      - $ref: '#/channels/control/messages/ListProfilesRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/ListProfilesReply'
+  loadProfile:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: >-
+      Load a saved profile (STANDALONE only): REPLACES the live source set with
+      the profile's sources, filters, and per-source audio, and -- when the
+      profile's fps tier differs from the running tier -- re-tiers live in-process
+      (a second obs_reset_video) without a restart. Rejects with 1013
+      ProfilesUnavailable in managed mode.
+    messages:
+      - $ref: '#/channels/control/messages/LoadProfileRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/LoadProfileReply'
+  saveProfile:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: >-
+      Save the live scene (sources + verbatim settings + per-source audio +
+      filter chain + fps tier + audio output device + window layout) as a named
+      profile (STANDALONE only). Rejects with 1013 ProfilesUnavailable in managed
+      mode.
+    messages:
+      - $ref: '#/channels/control/messages/SaveProfileRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/SaveProfileReply'
+  deleteProfile:
+    action: receive
+    channel: { $ref: '#/channels/control' }
+    summary: >-
+      Delete a saved profile (STANDALONE only). Rejects with 1013
+      ProfilesUnavailable in managed mode.
+    messages:
+      - $ref: '#/channels/control/messages/DeleteProfileRequest'
+    reply:
+      channel: { $ref: '#/channels/control' }
+      messages:
+        - $ref: '#/channels/control/messages/DeleteProfileReply'
+  publishEvents:
+    action: send
+    channel: { $ref: '#/channels/control' }
+    summary: >-
+      Server-pushed events. All pushes lack an `id` field (the demux key). All
+      events except instanceShuttingDown are delivered only to connections
+      subscribed to that event name; instanceShuttingDown is always delivered.
+    messages:
+      - $ref: '#/channels/control/messages/StatusEvent'
+      - $ref: '#/channels/control/messages/SourceAddedEvent'
+      - $ref: '#/channels/control/messages/SourceRemovedEvent'
+      - $ref: '#/channels/control/messages/SenderNameResolvedEvent'
+      - $ref: '#/channels/control/messages/BroadcastChangedEvent'
+      - $ref: '#/channels/control/messages/FilterAddedEvent'
+      - $ref: '#/channels/control/messages/FilterRemovedEvent'
+      - $ref: '#/channels/control/messages/FilterChangedEvent'
+      - $ref: '#/channels/control/messages/PropertyChangedEvent'
+      - $ref: '#/channels/control/messages/MediaChangedEvent'
+      - $ref: '#/channels/control/messages/AudioChangedEvent'
+      - $ref: '#/channels/control/messages/AudioLevelsEvent'
+      - $ref: '#/channels/control/messages/SourceIdleModeChangedEvent'
+      - $ref: '#/channels/control/messages/InstanceShuttingDownEvent'
+
+components:
+  messages:
+    # ----------------------------------------------------------- GetVersion
+    GetVersionRequest:
+      name: GetVersion
+      title: GetVersion request
+      summary: Version + capability handshake; no params.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: GetVersion }
+              params: { $ref: '#/components/schemas/NoParams' }
+      examples:
+        - name: request
+          payload: { id: 1, method: GetVersion }
+    GetVersionReply:
+      name: GetVersionReply
+      title: GetVersion reply
+      summary: >-
+        App version, protocol apiVersion (1), instance identity, and capability
+        sets. apiVersion mismatch should be treated as a warning by clients,
+        not a hard failure.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/GetVersionResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 1
+            result:
+              version: '0.5.0'
+              apiVersion: 1
+              instanceId: tier-60
+              fpsTier: 60
+              port: 7341
+              capabilities:
+                sourceTypes: [camera, display, window, game, media, image, color, text, audio_input, audio_output]
+                filterTypes: [color_correction, chroma_key, color_key, luma_key, crop, mask, lut, scale, scroll, sharpness, render_delay, video_delay, hdr_tonemap, gain, compressor, upward_compressor, expander, limiter, noise_gate, noise_suppress, eq_3band, invert_polarity]
+                events: [status, sourceAdded, sourceRemoved, filterAdded, filterRemoved, filterChanged, propertyChanged, mediaChanged, audioChanged, audioLevels, sourceIdleModeChanged, senderNameResolved, broadcastChanged]
+                audioOutput: true
+        - name: error-unknown-method
+          payload:
+            id: 1
+            error: { code: -32601, message: 'Unknown method: GetVresion' }
+
+    # ----------------------------------------------------------- GetStatus
+    GetStatusRequest:
+      name: GetStatus
+      title: GetStatus request
+      summary: Full live snapshot of this instance; no params.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: GetStatus }
+              params: { $ref: '#/components/schemas/NoParams' }
+      examples:
+        - name: request
+          payload: { id: 2, method: GetStatus }
+    GetStatusReply:
+      name: GetStatusReply
+      title: GetStatus reply
+      summary: >-
+        Instance lifecycle state, performance counters, and per-source detail.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/GetStatusResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 2
+            result:
+              state: broadcasting
+              instanceId: tier-60
+              port: 7341
+              version: '0.5.0'
+              fpsTier: 60
+              spoutPrefix: 'MACHINE:Helper_7341'
+              audioOutputDevice: default
+              fps: 59.94
+              avgFrameMs: 2.1
+              totalFrames: 12000
+              laggedFrames: 3
+              publishedSenderNames: ['MACHINE:Helper_7341_Desktop']
+              sources:
+                - sourceId: src_1
+                  type: display
+                  displayName: Desktop
+                  senderName: 'MACHINE:Helper_7341_Desktop'
+                  broadcasting: true
+                  format: srgb87
+                  sends: 11980
+                  lastSendOk: true
+                  width: 2560
+                  height: 1440
+
+    # ----------------------------------------------------------- ListSources
+    ListSourcesRequest:
+      name: ListSources
+      title: ListSources request
+      summary: List this instance's sources; no params.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ListSources }
+              params: { $ref: '#/components/schemas/NoParams' }
+      examples:
+        - name: request
+          payload: { id: 3, method: ListSources }
+    ListSourcesReply:
+      name: ListSourcesReply
+      title: ListSources reply
+      summary: >-
+        Source summaries. senderName is null until the engine has resolved the
+        actual Spout sender name (after the first transmitted frame).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ListSourcesResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 3
+            result:
+              sources:
+                - { sourceId: src_1, type: display, displayName: Desktop, senderName: 'MACHINE:Helper_7341_Desktop', broadcasting: true, format: srgb87 }
+                - { sourceId: src_2, type: color, displayName: ColorA, senderName: null, broadcasting: false, format: srgb87 }
+
+    # ----------------------------------------------------------- ListSourceTypes
+    ListSourceTypesRequest:
+      name: ListSourceTypes
+      title: ListSourceTypes request
+      summary: Enumerate creatable source types; no params.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ListSourceTypes }
+              params: { $ref: '#/components/schemas/NoParams' }
+      examples:
+        - name: request
+          payload: { id: 30, method: ListSourceTypes }
+    ListSourceTypesReply:
+      name: ListSourceTypesReply
+      title: ListSourceTypes reply
+      summary: >-
+        The source types THIS instance can create (the same runtime-registered
+        set `GetVersion` capabilities.sourceTypes advertises, in the same
+        order), each with a human-readable display label and capability flags
+        describing the type: hasVideo = the type produces video frames (so a
+        delivery frame rate is meaningful for it); hasAudio = the type can
+        contribute audio to the instance mix; hasMedia = the type supports
+        media transport (GetMediaStatus / ControlMedia / SeekMedia). Flags
+        describe the TYPE; a given source's live behavior still depends on its
+        settings and input.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ListSourceTypesResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 30
+            result:
+              sourceTypes:
+                - { type: display, label: Display, hasVideo: true, hasAudio: false, hasMedia: false }
+                - { type: media, label: Media, hasVideo: true, hasAudio: true, hasMedia: true }
+                - { type: audio_input, label: Audio Input, hasVideo: false, hasAudio: true, hasMedia: false }
+
+    # ----------------------------------------------------------- CreateSource
+    CreateSourceRequest:
+      name: CreateSource
+      title: CreateSource request
+      summary: >-
+        Create a source at runtime. Runtime-created sources are EPHEMERAL (they
+        do not survive instance restart). settings keys are discoverable via
+        ListSourceProperties on a created source of the same type. format
+        selects the sender pixel format (srgb87 when omitted); gain, muted,
+        balance, and syncOffsetMs seed the source's audio state (defaults
+        1.0 / false / 0.5 / 0). Runtime creation of an exclusive device
+        (cameras, capture hooks) held by another process fails best-effort with
+        1005 DeviceBusy.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: CreateSource }
+              params: { $ref: '#/components/schemas/CreateSourceParams' }
+      examples:
+        - name: request
+          payload:
+            id: 4
+            method: CreateSource
+            params:
+              type: color
+              displayName: ColorA
+              settings: { color: 4280303808, width: 640, height: 360 }
+              startBroadcast: true
+    CreateSourceReply:
+      name: CreateSourceReply
+      title: CreateSource reply
+      summary: >-
+        senderName is ALWAYS null in this reply -- the actual Spout sender name
+        resolves only after the first transmitted frame and may be
+        collision-suffixed. Bind receivers on the senderNameResolved event (or
+        a later ListSources/GetStatus), never on this reply.
+        Errors: 1003, 1005, 1006, 1008, 1010.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/CreateSourceResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 4
+            result: { sourceId: src_3, type: color, displayName: ColorA, senderName: null, broadcasting: true, format: srgb87 }
+        - name: error-bad-type
+          payload:
+            id: 4
+            error:
+              code: 1003
+              message: 'Unsupported source type: webcam'
+              data: { category: source, detail: 'supported types are listed in GetVersion capabilities.sourceTypes' }
+
+    # ----------------------------------------------------------- RemoveSource
+    RemoveSourceRequest:
+      name: RemoveSource
+      title: RemoveSource request
+      summary: >-
+        Remove a source from the running instance (stops its sender first if
+        broadcasting).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: RemoveSource }
+              params: { $ref: '#/components/schemas/RemoveSourceParams' }
+      examples:
+        - name: request
+          payload: { id: 5, method: RemoveSource, params: { sourceId: src_3 } }
+    RemoveSourceReply:
+      name: RemoveSourceReply
+      title: RemoveSource reply
+      summary: 'Errors: 1001.'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/RemovedResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 5, result: { removed: true } }
+        - name: error-not-found
+          payload:
+            id: 5
+            error: { code: 1001, message: 'No such source: src_99', data: { category: source, sourceId: src_99 } }
+
+    # ----------------------------------------------------------- SetSourceProperties
+    SetSourcePropertiesRequest:
+      name: SetSourceProperties
+      title: SetSourceProperties request
+      summary: >-
+        Partial settings update; keys not present are left unchanged. Keys and
+        value constraints are discoverable via ListSourceProperties.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SetSourceProperties }
+              params: { $ref: '#/components/schemas/SetSourcePropertiesParams' }
+      examples:
+        - name: request
+          payload:
+            id: 6
+            method: SetSourceProperties
+            params: { sourceId: src_2, settings: { color: 4278255360 } }
+    SetSourcePropertiesReply:
+      name: SetSourcePropertiesReply
+      title: SetSourceProperties reply
+      summary: >-
+        applied echoes the submitted keys with their stored values after the
+        update. Errors: 1001, 1006.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SetSourcePropertiesResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 6, result: { sourceId: src_2, applied: { color: 4278255360 } } }
+
+    # ----------------------------------------------------------- ListSourceProperties
+    ListSourcePropertiesRequest:
+      name: ListSourceProperties
+      title: ListSourceProperties request
+      summary: Property descriptors + current settings for one source.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ListSourceProperties }
+              params: { $ref: '#/components/schemas/ListSourcePropertiesParams' }
+      examples:
+        - name: request
+          payload: { id: 7, method: ListSourceProperties, params: { sourceId: src_1 } }
+    ListSourcePropertiesReply:
+      name: ListSourcePropertiesReply
+      title: ListSourceProperties reply
+      summary: 'Errors: 1001.'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ListPropertiesResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 7
+            result:
+              properties:
+                - name: monitor_id
+                  label: Display
+                  type: list
+                  visible: true
+                  enabled: true
+                  listFormat: string
+                  listEditable: false
+                  items:
+                    - { label: 'Display 1 (Primary)', value: 'DISPLAY-1', disabled: false }
+                - name: capture_cursor
+                  label: Capture Cursor
+                  type: bool
+                  visible: true
+                  enabled: true
+              settings: { monitor_id: DISPLAY-1, capture_cursor: true }
+
+    # ----------------------------------------------------------- EnumerateSourceVariants
+    EnumerateSourceVariantsRequest:
+      name: EnumerateSourceVariants
+      title: EnumerateSourceVariants request
+      summary: >-
+        Enumerate the full option dependency tree of a source TYPE (by wire type, not a live
+        source). NON-MUTATING: the helper builds a transient type-only properties object and never
+        touches any existing source, so it is safe to call while sources are capturing.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: EnumerateSourceVariants }
+              params: { $ref: '#/components/schemas/EnumerateSourceVariantsParams' }
+      examples:
+        - name: request
+          payload: { id: 8, method: EnumerateSourceVariants, params: { type: camera } }
+    EnumerateSourceVariantsReply:
+      name: EnumerateSourceVariantsReply
+      title: EnumerateSourceVariants reply
+      summary: >-
+        For camera, variants.devices is the static cascade device -> resolution -> {fps, formats}.
+        For every other type, variants.properties is the flat current-descriptor snapshot (same shape
+        as ListSourceProperties.properties). Errors: 1003.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/EnumerateSourceVariantsResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: camera-cascade
+          payload:
+            id: 8
+            result:
+              type: camera
+              engineId: dshow_input
+              variants:
+                devices:
+                  - id: '\\?\usb#vid_046d...'
+                    name: Logitech BRIO
+                    resolutions:
+                      - value: '1920x1080'
+                        fps:
+                          - { label: '30', value: 30, interval: 333333 }
+                        formats:
+                          - { label: 'YUY2', value: 2 }
+        - name: dynamic-list
+          payload:
+            id: 9
+            result:
+              type: display
+              engineId: monitor_capture
+              variants:
+                properties:
+                  - name: monitor_id
+                    label: Display
+                    type: list
+                    visible: true
+                    enabled: true
+                    listFormat: string
+                    listEditable: false
+                    items:
+                      - { label: 'Display 1 (Primary)', value: 'DISPLAY-1', disabled: false }
+
+    # ----------------------------------------------------------- ListAvailableFilters
+    ListAvailableFiltersRequest:
+      name: ListAvailableFilters
+      title: ListAvailableFilters request
+      summary: >-
+        Filter types this instance can add. With sourceId, restricted to types
+        applicable to that source; without, the full set. The set is enumerated
+        at runtime from the loaded modules -- never assume a fixed count.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ListAvailableFilters }
+              params: { $ref: '#/components/schemas/ListAvailableFiltersParams' }
+      examples:
+        - name: request
+          payload: { id: 8, method: ListAvailableFilters }
+    ListAvailableFiltersReply:
+      name: ListAvailableFiltersReply
+      title: ListAvailableFilters reply
+      summary: 'Errors: 1001 (when sourceId is given and unknown).'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ListAvailableFiltersResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 8
+            result:
+              filters:
+                - { filterType: color_correction, kind: video, label: Color Correction }
+                - { filterType: chroma_key, kind: video, label: Chroma Key }
+                - { filterType: gain, kind: audio, label: Gain }
+                - { filterType: noise_suppress, kind: audio, label: Noise Suppression }
+
+    # ----------------------------------------------------------- AddFilter
+    AddFilterRequest:
+      name: AddFilter
+      title: AddFilter request
+      summary: >-
+        Add a filter to a source. name is a display label (defaults to the
+        filter type label; not required to be unique) -- filterId is the
+        identity. settings keys are discoverable via ListFilterProperties.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: AddFilter }
+              params: { $ref: '#/components/schemas/AddFilterParams' }
+      examples:
+        - name: request
+          payload:
+            id: 9
+            method: AddFilter
+            params:
+              sourceId: src_1
+              filterType: chroma_key
+              name: Key
+              settings: { key_color_type: green, similarity: 400 }
+    AddFilterReply:
+      name: AddFilterReply
+      title: AddFilter reply
+      summary: 'Errors: 1001, 1004, 1006.'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/AddFilterResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 9, result: { filterId: flt_1, filterType: chroma_key, name: Key } }
+
+    # ----------------------------------------------------------- RemoveFilter
+    RemoveFilterRequest:
+      name: RemoveFilter
+      title: RemoveFilter request
+      summary: Remove a filter from a source.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: RemoveFilter }
+              params: { $ref: '#/components/schemas/RemoveFilterParams' }
+      examples:
+        - name: request
+          payload: { id: 10, method: RemoveFilter, params: { sourceId: src_1, filterId: flt_1 } }
+    RemoveFilterReply:
+      name: RemoveFilterReply
+      title: RemoveFilter reply
+      summary: 'Errors: 1001, 1002.'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/RemovedResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 10, result: { removed: true } }
+
+    # ----------------------------------------------------------- SetFilterProperties
+    SetFilterPropertiesRequest:
+      name: SetFilterProperties
+      title: SetFilterProperties request
+      summary: Partial settings update on a filter.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SetFilterProperties }
+              params: { $ref: '#/components/schemas/SetFilterPropertiesParams' }
+      examples:
+        - name: request
+          payload:
+            id: 11
+            method: SetFilterProperties
+            params: { sourceId: src_1, filterId: flt_1, settings: { similarity: 350 } }
+    SetFilterPropertiesReply:
+      name: SetFilterPropertiesReply
+      title: SetFilterProperties reply
+      summary: 'Errors: 1001, 1002, 1006.'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SetFilterPropertiesResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 11, result: { filterId: flt_1, applied: { similarity: 350 } } }
+
+    # ----------------------------------------------------------- ListFilterProperties
+    ListFilterPropertiesRequest:
+      name: ListFilterProperties
+      title: ListFilterProperties request
+      summary: Property descriptors + current settings for one filter.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ListFilterProperties }
+              params: { $ref: '#/components/schemas/ListFilterPropertiesParams' }
+      examples:
+        - name: request
+          payload: { id: 12, method: ListFilterProperties, params: { sourceId: src_1, filterId: flt_1 } }
+    ListFilterPropertiesReply:
+      name: ListFilterPropertiesReply
+      title: ListFilterProperties reply
+      summary: 'Errors: 1001, 1002.'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ListPropertiesResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 12
+            result:
+              properties:
+                - name: similarity
+                  label: Similarity
+                  type: int
+                  visible: true
+                  enabled: true
+                  min: 1
+                  max: 1000
+                  step: 1
+                  display: slider
+              settings: { similarity: 350 }
+
+    # ----------------------------------------------------------- ListFilters
+    ListFiltersRequest:
+      name: ListFilters
+      title: ListFilters request
+      summary: List a source's filter chain in order (index 0 applies first).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ListFilters }
+              params: { $ref: '#/components/schemas/ListFiltersParams' }
+      examples:
+        - name: request
+          payload: { id: 19, method: ListFilters, params: { sourceId: src_1 } }
+    ListFiltersReply:
+      name: ListFiltersReply
+      title: ListFilters reply
+      summary: >-
+        filters is ordered by chain position (index 0 = first applied).
+        Errors: 1001.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ListFiltersResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 19
+            result:
+              filters:
+                - { filterId: flt_1, filterType: chroma_key, name: Key, kind: video, enabled: true, index: 0 }
+                - { filterId: flt_2, filterType: color_correction, name: Color Correction, kind: video, enabled: false, index: 1 }
+
+    # ----------------------------------------------------------- SetFilterEnabled
+    SetFilterEnabledRequest:
+      name: SetFilterEnabled
+      title: SetFilterEnabled request
+      summary: >-
+        Enable or disable a filter without removing it. Idempotent: setting
+        the current state succeeds; filterChanged is emitted only on an
+        actual transition.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SetFilterEnabled }
+              params: { $ref: '#/components/schemas/SetFilterEnabledParams' }
+      examples:
+        - name: request
+          payload: { id: 20, method: SetFilterEnabled, params: { sourceId: src_1, filterId: flt_2, enabled: true } }
+    SetFilterEnabledReply:
+      name: SetFilterEnabledReply
+      title: SetFilterEnabled reply
+      summary: 'enabled echoes the effective state. Errors: 1001, 1002.'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SetFilterEnabledResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 20, result: { filterId: flt_2, enabled: true } }
+
+    # ----------------------------------------------------------- ReorderFilter
+    ReorderFilterRequest:
+      name: ReorderFilter
+      title: ReorderFilter request
+      summary: >-
+        Move a filter to position index in its source's chain (0 = first
+        applied). Out-of-range indexes are clamped to the valid range. Other
+        filters' indexes shift accordingly -- one filterChanged fires for the
+        moved filter only; clients wanting the full order re-issue
+        ListFilters.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ReorderFilter }
+              params: { $ref: '#/components/schemas/ReorderFilterParams' }
+      examples:
+        - name: request
+          payload: { id: 21, method: ReorderFilter, params: { sourceId: src_1, filterId: flt_2, index: 0 } }
+    ReorderFilterReply:
+      name: ReorderFilterReply
+      title: ReorderFilter reply
+      summary: 'index is the effective position after the move. Errors: 1001, 1002.'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ReorderFilterResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 21, result: { filterId: flt_2, index: 0 } }
+
+    # ----------------------------------------------------------- SetFilterName
+    SetFilterNameRequest:
+      name: SetFilterName
+      title: SetFilterName request
+      summary: >-
+        Rename a filter's display label (the same non-unique label AddFilter's
+        name parameter seeds). filterId is the identity and never changes.
+        Setting the current name is an idempotent no-op; filterChanged{name}
+        is emitted only on an actual change.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SetFilterName }
+              params: { $ref: '#/components/schemas/SetFilterNameParams' }
+      examples:
+        - name: request
+          payload: { id: 24, method: SetFilterName, params: { sourceId: src_1, filterId: flt_2, name: Warm Grade } }
+    SetFilterNameReply:
+      name: SetFilterNameReply
+      title: SetFilterName reply
+      summary: 'name echoes the stored label. Errors: 1001, 1002.'
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SetFilterNameResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 24, result: { filterId: flt_2, name: Warm Grade } }
+
+    # ----------------------------------------------------------- InvokeSourceButton
+    InvokeSourceButtonRequest:
+      name: InvokeSourceButton
+      title: InvokeSourceButton request
+      summary: >-
+        Invoke a button property (PropertyDescriptor type 'button') on a
+        source, or with filterId on one of its filters. Buttons may open
+        native dialogs on the instance's machine (the endpoint is loopback
+        only, so the dialog appears on the operator's own desktop) -- e.g. a
+        camera source's video_config (driver settings dialog) or its activate
+        toggle. Button side effects do not emit propertyChanged; re-fetch
+        ListSourceProperties / ListFilterProperties after invoking. No
+        current filter type registers button properties; filterId is accepted
+        for completeness.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: InvokeSourceButton }
+              params: { $ref: '#/components/schemas/InvokeSourceButtonParams' }
+      examples:
+        - name: request
+          payload: { id: 22, method: InvokeSourceButton, params: { sourceId: src_1, property: video_config } }
+    InvokeSourceButtonReply:
+      name: InvokeSourceButtonReply
+      title: InvokeSourceButton reply
+      summary: >-
+        Errors: 1001, 1002 (filterId given and unknown), 1006 (the named
+        property does not exist or is not a button).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/InvokedResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 22, result: { invoked: true } }
+        - name: error-not-a-button
+          payload:
+            id: 22
+            error:
+              code: 1006
+              message: "Property 'capture_cursor' is not a button"
+              data: { category: source, sourceId: src_1, property: capture_cursor }
+
+    # ----------------------------------------------------------- ListAudioDevices
+    ListAudioDevicesRequest:
+      name: ListAudioDevices
+      title: ListAudioDevices request
+      summary: >-
+        Enumerate system audio endpoints. flow filters to render (playback) or
+        capture (recording) endpoints; omitted returns both.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ListAudioDevices }
+              params: { $ref: '#/components/schemas/ListAudioDevicesParams' }
+      examples:
+        - name: request
+          payload: { id: 13, method: ListAudioDevices, params: { flow: render } }
+    ListAudioDevicesReply:
+      name: ListAudioDevicesReply
+      title: ListAudioDevices reply
+      summary: >-
+        Device ids are system endpoint ids usable as the device-selection
+        settings value for audio_input / audio_output sources.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ListAudioDevicesResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 13
+            result:
+              devices:
+                - { id: '{0.0.0.00000000}.{a1b2c3d4-0000-0000-0000-000000000000}', name: 'Speakers (Realtek)', flow: render, isDefault: true }
+
+    # ----------------------------------------------------------- SetAudioOutputDevice
+    SetAudioOutputDeviceRequest:
+      name: SetAudioOutputDevice
+      title: SetAudioOutputDevice request
+      summary: >-
+        Select the device this instance's mixed audio (every broadcasting
+        source's audio, after gain/mute/balance) is rendered to. deviceId is
+        an endpoint id from ListAudioDevices (flow render), or the sentinel
+        'default', which follows the system default render endpoint live.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SetAudioOutputDevice }
+              params: { $ref: '#/components/schemas/SetAudioOutputDeviceParams' }
+      examples:
+        - name: request
+          payload:
+            id: 14
+            method: SetAudioOutputDevice
+            params: { deviceId: '{0.0.0.00000000}.{a1b2c3d4-0000-0000-0000-000000000000}' }
+    SetAudioOutputDeviceReply:
+      name: SetAudioOutputDeviceReply
+      title: SetAudioOutputDevice reply
+      summary: >-
+        deviceId echoes the STORED selection ('default' stays 'default'; it is
+        never resolved to a concrete endpoint id). Runtime device changes are
+        ephemeral (persistence semantics). On builds where GetVersion
+        capabilities.audioOutput is false, this method replies 1007
+        NotImplemented. Errors: 1005 (the device exists but could not be
+        opened), 1006 (unknown deviceId; data.property is 'deviceId'), 1007.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SetAudioOutputDeviceResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 14, result: { deviceId: default } }
+        - name: error-unknown-device
+          payload:
+            id: 14
+            error:
+              code: 1006
+              message: 'Unknown audio output device'
+              data: { category: audio, property: deviceId }
+
+    # ----------------------------------------------------------- StartBroadcast
+    StartBroadcastRequest:
+      name: StartBroadcast
+      title: StartBroadcast request
+      summary: >-
+        Start sending. With no params (or an empty sourceIds), attaches ALL
+        eligible sources on this instance; with sourceIds, attaches only the
+        named subset. Idempotent for already-broadcasting sources (they are
+        simply not listed in started).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: StartBroadcast }
+              params: { $ref: '#/components/schemas/BroadcastParams' }
+      examples:
+        - name: request-all
+          payload: { id: 15, method: StartBroadcast }
+    StartBroadcastReply:
+      name: StartBroadcastReply
+      title: StartBroadcast reply
+      summary: >-
+        started lists the sourceIds newly attached by this call. Sender names
+        for newly attached sources resolve asynchronously (senderNameResolved).
+        Errors: 1001 (a named id is unknown), 1008, 1011.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/StartBroadcastResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 15, result: { broadcasting: true, started: [src_1, src_2] } }
+
+    # ----------------------------------------------------------- StopBroadcast
+    StopBroadcastRequest:
+      name: StopBroadcast
+      title: StopBroadcast request
+      summary: >-
+        Stop sending. With no params (or an empty sourceIds), detaches ALL
+        broadcasting sources; with sourceIds, only the named subset.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: StopBroadcast }
+              params: { $ref: '#/components/schemas/BroadcastParams' }
+      examples:
+        - name: request-all
+          payload: { id: 16, method: StopBroadcast }
+    StopBroadcastReply:
+      name: StopBroadcastReply
+      title: StopBroadcast reply
+      summary: >-
+        broadcasting reports whether any source is still attached after this
+        call. Errors: 1001.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/StopBroadcastResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 16, result: { broadcasting: false, stopped: [src_1, src_2] } }
+
+    # ----------------------------------------------------------- SetSourceFormat
+    SetSourceFormatRequest:
+      name: SetSourceFormat
+      title: SetSourceFormat request
+      summary: >-
+        Change the pixel format this source's Spout sender emits (see the
+        SourceFormat schema). The format is fixed per sender attach: a change
+        on a broadcasting source recreates its sender (detach + re-attach), so
+        the source briefly reports senderName null and a fresh
+        senderNameResolved fires (the name normally resolves back to the same
+        string). On a non-broadcasting source the new format applies at the
+        next attach. Setting the current format is an idempotent no-op.
+        Runtime format changes are ephemeral (persistence semantics).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SetSourceFormat }
+              params: { $ref: '#/components/schemas/SetSourceFormatParams' }
+      examples:
+        - name: request
+          payload: { id: 23, method: SetSourceFormat, params: { sourceId: src_2, format: fp16 } }
+    SetSourceFormatReply:
+      name: SetSourceFormatReply
+      title: SetSourceFormat reply
+      summary: >-
+        format echoes the applied value. Format changes carry no dedicated
+        event: clients observe them via the format field on ListSources /
+        GetStatus / sourceAdded (and the senderNameResolved that follows a
+        broadcasting source's re-attach). Errors: 1001, 1006 (unknown format
+        value), 1011 (the transition could not be applied).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SetSourceFormatResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 23, result: { sourceId: src_2, format: fp16 } }
+
+    # ----------------------------------------------------------- GetMediaStatus
+    GetMediaStatusRequest:
+      name: GetMediaStatus
+      title: GetMediaStatus request
+      summary: Media transport snapshot for one media-capable source.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: GetMediaStatus }
+              params: { $ref: '#/components/schemas/GetMediaStatusParams' }
+      examples:
+        - name: request
+          payload: { id: 25, method: GetMediaStatus, params: { sourceId: src_4 } }
+    GetMediaStatusReply:
+      name: GetMediaStatusReply
+      title: GetMediaStatus reply
+      summary: >-
+        durationMs is null while the duration is unknown (streams, or media
+        still opening). looping mirrors the source's 'looping' setting -- a
+        read convenience; the setting itself (via SetSourceProperties) stays
+        the write path and emits propertyChanged when changed. Errors: 1001,
+        1012.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/GetMediaStatusResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 25
+            result: { sourceId: src_4, state: playing, positionMs: 12500, durationMs: 60000, looping: true }
+        - name: error-not-media
+          payload:
+            id: 25
+            error:
+              code: 1012
+              message: 'Source src_1 (display) does not support media transport'
+              data: { category: source, sourceId: src_1 }
+
+    # ----------------------------------------------------------- ControlMedia
+    ControlMediaRequest:
+      name: ControlMedia
+      title: ControlMedia request
+      summary: >-
+        Drive playback of a media-capable source: play resumes a paused or
+        ended source (no-op while playing); pause holds the current position
+        (no-op while paused); restart plays from the beginning; stop halts
+        playback and resets the position to 0. Actions are idempotent --
+        requesting the current state is not an error. An actual state
+        transition, from any origin (wire or the instance's own UI), emits
+        mediaChanged.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ControlMedia }
+              params: { $ref: '#/components/schemas/ControlMediaParams' }
+      examples:
+        - name: request
+          payload: { id: 26, method: ControlMedia, params: { sourceId: src_4, action: pause } }
+    ControlMediaReply:
+      name: ControlMediaReply
+      title: ControlMedia reply
+      summary: >-
+        state is the authoritative post-action media state. Actions are
+        best-effort against the live pipeline -- e.g. play on a source whose
+        media is still opening simply echoes the current state. Errors:
+        1001, 1012.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ControlMediaResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 26, result: { sourceId: src_4, state: paused } }
+
+    # ----------------------------------------------------------- SeekMedia
+    SeekMediaRequest:
+      name: SeekMedia
+      title: SeekMedia request
+      summary: >-
+        Seek a media-capable source to positionMs. Requires a KNOWN
+        duration: when GetMediaStatus reports durationMs null (streams,
+        still-opening media), SeekMedia replies 1012 -- the engine's seek
+        hook is fire-and-forget and non-seekable media would silently ignore
+        it, so the server rejects up front instead of faking success.
+        positionMs is clamped to [0, durationMs].
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SeekMedia }
+              params: { $ref: '#/components/schemas/SeekMediaParams' }
+      examples:
+        - name: request
+          payload: { id: 27, method: SeekMedia, params: { sourceId: src_4, positionMs: 30000 } }
+    SeekMediaReply:
+      name: SeekMediaReply
+      title: SeekMedia reply
+      summary: >-
+        positionMs is the effective position after the clamp. Seeking does
+        not change the play/pause state and emits no mediaChanged. Errors:
+        1001, 1012.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SeekMediaResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 27, result: { sourceId: src_4, positionMs: 30000 } }
+        - name: error-unknown-duration
+          payload:
+            id: 27
+            error:
+              code: 1012
+              message: 'Source src_5 has no known duration to seek within'
+              data: { category: source, sourceId: src_5, detail: 'durationMs is null (stream or still opening); seek requires a known duration' }
+
+    # ----------------------------------------------------------- GetSourceAudio
+    GetSourceAudioRequest:
+      name: GetSourceAudio
+      title: GetSourceAudio request
+      summary: Per-source audio state snapshot (gain, muted, balance, syncOffsetMs).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: GetSourceAudio }
+              params: { $ref: '#/components/schemas/GetSourceAudioParams' }
+      examples:
+        - name: request
+          payload: { id: 28, method: GetSourceAudio, params: { sourceId: src_4 } }
+    GetSourceAudioReply:
+      name: GetSourceAudioReply
+      title: GetSourceAudio reply
+      summary: >-
+        gain is a linear multiplier (1.0 unity); muted silences the source's
+        contribution while preserving gain; balance is [0,1] with 0.5 center
+        (sine-law); syncOffsetMs is a positive-only audio delay in
+        milliseconds for A/V alignment against the live-relayed video (0 =
+        none). The values govern the source's contribution to this
+        instance's mixed audio output. Available for ALL sources -- on a
+        source with no audio they are stored and inert. Errors: 1001.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SourceAudioResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 28, result: { sourceId: src_4, gain: 1.0, muted: false, balance: 0.5, syncOffsetMs: 0 } }
+
+    # ----------------------------------------------------------- SetSourceAudio
+    SetSourceAudioRequest:
+      name: SetSourceAudio
+      title: SetSourceAudio request
+      summary: >-
+        Partial update of a source's audio state; at least one of gain /
+        muted / balance / syncOffsetMs must be present (-32602 otherwise).
+        Accepted for ALL sources (the audio state fields are universal
+        source state; on a source with no audio the values are stored and
+        inert). An actual change emits audioChanged; setting the current
+        values emits nothing. A live syncOffsetMs change splices with a
+        ~5 ms fade: an increase inserts that much silence (the added delay
+        materializing), a decrease skips that much content.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SetSourceAudio }
+              params: { $ref: '#/components/schemas/SetSourceAudioParams' }
+      examples:
+        - name: request
+          payload: { id: 29, method: SetSourceAudio, params: { sourceId: src_4, gain: 1.5, muted: false } }
+    SetSourceAudioReply:
+      name: SetSourceAudioReply
+      title: SetSourceAudio reply
+      summary: >-
+        Full applied echo of the source's audio state. gain values above 20.0
+        (about +26 dB) and syncOffsetMs values above 950 are clamped -- the
+        echo carries the effective values. Errors: 1001.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SourceAudioResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 29, result: { sourceId: src_4, gain: 1.5, muted: false, balance: 0.5, syncOffsetMs: 0 } }
+
+    # ----------------------------------------------------------- SetSourceIdleMode
+    SetSourceIdleModeRequest:
+      name: SetSourceIdleMode
+      title: SetSourceIdleMode request
+      summary: >-
+        Set a source's idle device-release mode. releaseWhenIdle=true releases the
+        exclusive capture device while the source is idle (no broadcast consumer),
+        reacquiring it on the next StartBroadcast. Accepted for ALL sources; the mode
+        is recorded uniformly but is behaviorally observable only on device-holding
+        types (camera, audio input/output). An actual change emits sourceIdleModeChanged.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SetSourceIdleMode }
+              params: { $ref: '#/components/schemas/SetSourceIdleModeParams' }
+      examples:
+        - name: request
+          payload: { id: 30, method: SetSourceIdleMode, params: { sourceId: src_4, releaseWhenIdle: true } }
+    SetSourceIdleModeReply:
+      name: SetSourceIdleModeReply
+      title: SetSourceIdleMode reply
+      summary: >-
+        Echo of the effective idle mode after the update. Errors: 1001 (source not found).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SetSourceIdleModeResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 30, result: { sourceId: src_4, releaseWhenIdle: true } }
+
+    # ----------------------------------------------------------- Subscribe
+    SubscribeRequest:
+      name: Subscribe
+      title: Subscribe request
+      summary: >-
+        Opt this connection in to the named events. events must be a non-empty
+        array (otherwise -32602). Names this instance does not support are
+        silently omitted from the ack (capability discovery).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: Subscribe }
+              params: { $ref: '#/components/schemas/SubscribeParams' }
+      examples:
+        - name: request
+          payload:
+            id: 17
+            method: Subscribe
+            params: { events: [status, sourceAdded, sourceRemoved, senderNameResolved, broadcastChanged] }
+    SubscribeReply:
+      name: SubscribeReply
+      title: Subscribe reply
+      summary: >-
+        subscribed lists the names NEWLY added to this connection's subscription
+        set by this call; names already subscribed, unknown, or unsupported by
+        this instance are omitted -- a fully duplicate Subscribe therefore acks
+        an empty array. Pushes for accepted names begin after this ack. The
+        subscription set is per-connection and is lost on disconnect;
+        re-subscribe after every reconnect.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SubscribeResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload:
+            id: 17
+            result: { subscribed: [status, sourceAdded, sourceRemoved, senderNameResolved, broadcastChanged] }
+        - name: error-empty
+          payload:
+            id: 17
+            error: { code: -32602, message: "Invalid params: 'events' must be a non-empty array" }
+
+    # ----------------------------------------------------------- Unsubscribe
+    UnsubscribeRequest:
+      name: Unsubscribe
+      title: Unsubscribe request
+      summary: >-
+        Opt this connection out of the named events (symmetric with Subscribe;
+        empty/missing events is -32602). Unknown or not-subscribed names are
+        silently omitted from the ack.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: Unsubscribe }
+              params: { $ref: '#/components/schemas/SubscribeParams' }
+      examples:
+        - name: request
+          payload: { id: 18, method: Unsubscribe, params: { events: [status] } }
+    UnsubscribeReply:
+      name: UnsubscribeReply
+      title: Unsubscribe reply
+      summary: unsubscribed lists the names removed from this connection's set.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/UnsubscribeResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: success
+          payload: { id: 18, result: { unsubscribed: [status] } }
+
+    # ----------------------------------------------------------- events
+    StatusEvent:
+      name: status
+      title: status event
+      summary: >-
+        Periodic telemetry, emitted every 1000 ms while at least one connection
+        is subscribed to 'status'. Not emitted on connect -- call GetStatus once
+        for the initial snapshot. Structural changes have their own edge events;
+        the per-source shape here is deliberately narrow (no format/type/name --
+        snapshot verbs carry those).
+      payload: { $ref: '#/components/schemas/StatusEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: status
+            data:
+              instanceId: tier-60
+              ts: 1765300000123
+              state: broadcasting
+              fps: 59.94
+              avgFrameMs: 2.1
+              totalFrames: 12000
+              laggedFrames: 3
+              sources:
+                - { sourceId: src_1, senderName: 'MACHINE:Helper_7341_Desktop', broadcasting: true, lastSendOk: true }
+    SourceAddedEvent:
+      name: sourceAdded
+      title: sourceAdded event
+      summary: >-
+        A source was added to this instance (at runtime or during start-up).
+        source.senderName may still be null at this point.
+      payload: { $ref: '#/components/schemas/SourceAddedEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: sourceAdded
+            data:
+              instanceId: tier-60
+              ts: 1765300000123
+              source: { sourceId: src_3, type: color, displayName: ColorA, senderName: null, broadcasting: true, format: srgb87 }
+    SourceRemovedEvent:
+      name: sourceRemoved
+      title: sourceRemoved event
+      summary: A source was removed from this instance.
+      payload: { $ref: '#/components/schemas/SourceRemovedEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: sourceRemoved
+            data: { instanceId: tier-60, ts: 1765300000123, sourceId: src_3 }
+    SenderNameResolvedEvent:
+      name: senderNameResolved
+      title: senderNameResolved event
+      summary: >-
+        The ACTUAL registered Spout sender name for a source became known (after
+        its first transmitted frame), or changed (rare collision-resolution
+        case). This is the moment to bind a receiver -- the name is identical
+        to the one published in the discovery file. Also fires for sources
+        re-attached by StartBroadcast.
+      payload: { $ref: '#/components/schemas/SenderNameResolvedEventEnvelope' }
+      examples:
+        - name: push-collision-suffixed
+          payload:
+            event: senderNameResolved
+            data:
+              instanceId: tier-60
+              ts: 1765300000123
+              sourceId: src_3
+              senderName: 'MACHINE:Helper_7341_ColorA_2'
+    BroadcastChangedEvent:
+      name: broadcastChanged
+      title: broadcastChanged event
+      summary: >-
+        Broadcast state transitioned -- by StartBroadcast/StopBroadcast, or by
+        an internal stop. sourceId identifies a per-source transition; null
+        means an instance-wide transition.
+      payload: { $ref: '#/components/schemas/BroadcastChangedEventEnvelope' }
+      examples:
+        - name: push-instance-wide
+          payload:
+            event: broadcastChanged
+            data: { instanceId: tier-60, ts: 1765300000123, sourceId: null, broadcasting: false }
+    FilterAddedEvent:
+      name: filterAdded
+      title: filterAdded event
+      summary: >-
+        A filter was added to a source on this instance -- by AddFilter from
+        any connection, or by the instance's own UI. filter.index is its
+        chain position.
+      payload: { $ref: '#/components/schemas/FilterAddedEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: filterAdded
+            data:
+              instanceId: tier-60
+              ts: 1765300000123
+              sourceId: src_1
+              filter: { filterId: flt_3, filterType: gain, name: Gain, kind: audio, enabled: true, index: 2 }
+    FilterRemovedEvent:
+      name: filterRemoved
+      title: filterRemoved event
+      summary: A filter was removed from a source on this instance.
+      payload: { $ref: '#/components/schemas/FilterRemovedEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: filterRemoved
+            data: { instanceId: tier-60, ts: 1765300000123, sourceId: src_1, filterId: flt_3 }
+    FilterChangedEvent:
+      name: filterChanged
+      title: filterChanged event
+      summary: >-
+        A filter's name, enabled state, or chain position changed -- by
+        SetFilterName / SetFilterEnabled / ReorderFilter from any connection,
+        or by the instance's own UI. Only the changed fields
+        are present (at least one of name/enabled/index); emitted on actual
+        transitions only. A reorder fires one filterChanged for the moved
+        filter; other filters' indexes shift implicitly -- re-issue
+        ListFilters for the full order.
+      payload: { $ref: '#/components/schemas/FilterChangedEventEnvelope' }
+      examples:
+        - name: push-reorder
+          payload:
+            event: filterChanged
+            data: { instanceId: tier-60, ts: 1765300000123, sourceId: src_1, filterId: flt_2, index: 0 }
+    PropertyChangedEvent:
+      name: propertyChanged
+      title: propertyChanged event
+      summary: >-
+        Settings were applied to a source (no filterId) or to one of its
+        filters (filterId present) -- by SetSourceProperties /
+        SetFilterProperties from any connection, or by the instance's own UI.
+        applied carries the same echo shape the Set verbs return (the
+        submitted keys with their stored values). Delivered to every
+        subscribed connection, including the one that issued the change.
+        Button side effects and format changes do not emit this event.
+      payload: { $ref: '#/components/schemas/PropertyChangedEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: propertyChanged
+            data: { instanceId: tier-60, ts: 1765300000123, sourceId: src_2, applied: { color: 4278255360 } }
+    MediaChangedEvent:
+      name: mediaChanged
+      title: mediaChanged event
+      summary: >-
+        A media-capable source's playback state transitioned -- by
+        ControlMedia from any connection, by the instance's own UI, or by
+        playback itself (a non-looping source reaching its end emits state
+        'ended'; a pipeline fault emits 'error'). Emitted on actual
+        transitions only. A looping wrap is NOT a transition: a looping
+        source stays 'playing' across the wrap and emits no mediaChanged per
+        wrap. positionMs is included where the engine reports a position.
+      payload: { $ref: '#/components/schemas/MediaChangedEventEnvelope' }
+      examples:
+        - name: push-ended
+          payload:
+            event: mediaChanged
+            data: { instanceId: tier-60, ts: 1765300000123, sourceId: src_4, state: ended, positionMs: 60000 }
+    AudioChangedEvent:
+      name: audioChanged
+      title: audioChanged event
+      summary: >-
+        A source's audio state (gain, muted, balance, syncOffsetMs) changed
+        -- by SetSourceAudio from any connection, or by the instance's own
+        UI. Only the changed fields are present (at least one of
+        gain/muted/balance/syncOffsetMs); emitted on actual transitions only
+        (a no-op set emits nothing).
+      payload: { $ref: '#/components/schemas/AudioChangedEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: audioChanged
+            data: { instanceId: tier-60, ts: 1765300000123, sourceId: src_4, gain: 1.5 }
+    AudioLevelsEvent:
+      name: audioLevels
+      title: audioLevels event
+      summary: >-
+        Periodic audio level telemetry, emitted every 100 ms while at least
+        one connection is subscribed to 'audioLevels'. peak and rms are
+        linear levels (dB conversion is the client's concern): per-source
+        levels are measured post gain/mute at the moment of mix contribution
+        (after any sync-offset delay) -- they track what is heard; master is
+        measured on the summed mix before the output
+        clamp, and clipped reports whether that clamp engaged since the
+        previous emit. sources covers the currently broadcasting
+        audio-contributing sources; a silent mix still emits (zeros are valid
+        readings). status and audioLevels are the two periodic events, both
+        opt-in; all other events are edge-driven.
+      payload: { $ref: '#/components/schemas/AudioLevelsEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: audioLevels
+            data:
+              instanceId: tier-60
+              ts: 1765300000123
+              master: { peak: 0.82, rms: 0.31, clipped: false }
+              sources:
+                - { sourceId: src_4, peak: 0.82, rms: 0.31 }
+    SourceIdleModeChangedEvent:
+      name: sourceIdleModeChanged
+      title: sourceIdleModeChanged event
+      summary: >-
+        A source's idle device-release mode changed (by SetSourceIdleMode from any
+        connection, or the instance's own UI). releaseWhenIdle is the effective mode.
+      payload: { $ref: '#/components/schemas/SourceIdleModeChangedEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: sourceIdleModeChanged
+            data: { instanceId: tier-60, ts: 1765300000123, sourceId: src_4, releaseWhenIdle: true }
+    InstanceShuttingDownEvent:
+      name: instanceShuttingDown
+      title: instanceShuttingDown event
+      summary: >-
+        ALWAYS delivered (no subscription needed) to every connected client,
+        once, immediately before this instance closes its control endpoint on
+        clean shutdown. Treat this instance's senders as going offline now; a
+        crash produces no such event (the socket just drops).
+      payload: { $ref: '#/components/schemas/InstanceShuttingDownEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: instanceShuttingDown
+            data: { instanceId: tier-60, ts: 1765300000123, reason: shutdown, graceMs: 5000 }
+
+    # ----------------------------------------------------------- Shutdown (1.5.0)
+    ShutdownRequest:
+      name: Shutdown
+      title: Shutdown request
+      summary: Request a clean exit of this instance.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: Shutdown }
+              params: { $ref: '#/components/schemas/ShutdownParams' }
+      examples:
+        - name: request
+          payload: { id: 90, method: Shutdown, params: { drain: true } }
+    ShutdownReply:
+      name: ShutdownReply
+      title: Shutdown reply
+      summary: >-
+        Acceptance ack. accepted is always true; drain echoes the effective
+        drain mode. A repeated Shutdown while already stopping carries
+        alreadyStopping=true and echoes the first committed drain.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ShutdownResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: accepted
+          payload: { id: 90, result: { accepted: true, drain: true } }
+        - name: already-stopping
+          payload: { id: 91, result: { accepted: true, drain: true, alreadyStopping: true } }
+
+    # ----------------------------------------------------------- Profiles (standalone only)
+    # The four profile verbs are STANDALONE-only: they reject with 1013 ProfilesUnavailable when the
+    # instance was launched owned (managed mode). They are additive; the closed verb set an integrator
+    # relies on is untouched.
+    ListProfilesRequest:
+      name: ListProfiles
+      title: ListProfiles request
+      summary: List this instance's saved scene profiles (standalone only).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: ListProfiles }
+              params: { $ref: '#/components/schemas/NoParams' }
+      examples:
+        - name: request
+          payload: { id: 100, method: ListProfiles }
+    ListProfilesReply:
+      name: ListProfilesReply
+      title: ListProfiles reply
+      summary: The saved profile names plus the last-loaded pointer. Error 1013 in managed mode.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/ListProfilesResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: profiles
+          payload: { id: 100, result: { profiles: [Studio, Stream], lastProfile: Studio } }
+    LoadProfileRequest:
+      name: LoadProfile
+      title: LoadProfile request
+      summary: >-
+        Load a saved profile (standalone only): REPLACES the live source set and,
+        when the profile's fps tier differs, re-tiers live in-process.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: LoadProfile }
+              params: { $ref: '#/components/schemas/ProfileNameParams' }
+      examples:
+        - name: request
+          payload: { id: 101, method: LoadProfile, params: { name: Studio } }
+    LoadProfileReply:
+      name: LoadProfileReply
+      title: LoadProfile reply
+      summary: >-
+        The loaded profile name, the now-running fps tier, and the rebuilt source
+        list. Error 1013 in managed mode, 1014 on an invalid name, 1015 when the
+        profile does not exist.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/LoadProfileResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: loaded
+          payload: { id: 101, result: { name: Studio, fpsTier: 60, sources: [] } }
+    SaveProfileRequest:
+      name: SaveProfile
+      title: SaveProfile request
+      summary: Save the live scene as a named profile (standalone only).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: SaveProfile }
+              params: { $ref: '#/components/schemas/ProfileNameParams' }
+      examples:
+        - name: request
+          payload: { id: 102, method: SaveProfile, params: { name: Studio } }
+    SaveProfileReply:
+      name: SaveProfileReply
+      title: SaveProfile reply
+      summary: The saved profile name and its source count. Error 1013 in managed mode, 1014 on an invalid name.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/SaveProfileResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: saved
+          payload: { id: 102, result: { name: Studio, sources: 2 } }
+    DeleteProfileRequest:
+      name: DeleteProfile
+      title: DeleteProfile request
+      summary: Delete a saved profile (standalone only).
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RequestEnvelope'
+          - type: object
+            properties:
+              method: { const: DeleteProfile }
+              params: { $ref: '#/components/schemas/ProfileNameParams' }
+      examples:
+        - name: request
+          payload: { id: 103, method: DeleteProfile, params: { name: Stream } }
+    DeleteProfileReply:
+      name: DeleteProfileReply
+      title: DeleteProfile reply
+      summary: >-
+        The deleted profile name. Error 1013 in managed mode, 1014 on an invalid
+        name, 1015 when the profile does not exist.
+      correlationId: { location: '$message.payload#/id' }
+      payload:
+        oneOf:
+          - type: object
+            required: [id, result]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              result: { $ref: '#/components/schemas/DeleteProfileResult' }
+          - $ref: '#/components/schemas/ErrorEnvelope'
+      examples:
+        - name: deleted
+          payload: { id: 103, result: { name: Stream, deleted: true } }
+
+  schemas:
+    # ----------------------------------------------------------- envelopes
+    Id:
+      description: Client-chosen request id (integer or string), echoed verbatim on the reply.
+      oneOf:
+        - { type: integer }
+        - { type: string }
+    NoParams:
+      type: object
+      description: This method takes no parameters; params may be omitted entirely.
+      additionalProperties: false
+    RequestEnvelope:
+      type: object
+      required: [id, method]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        method: { type: string, description: PascalCase verb name. }
+        params: { type: object, description: 'Per-verb parameters; omitted means {}.' }
+    ErrorObject:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: integer
+          description: >-
+            Protocol errors: -32700 parse, -32600 invalid request, -32601
+            method not found, -32602 invalid params. Application errors are in
+            the positive 1000-range (see the error table in the API
+            description): 1001 SourceNotFound, 1002 FilterNotFound, 1003
+            SourceTypeUnavailable, 1004 FilterTypeUnavailable, 1005 DeviceBusy,
+            1006 InvalidPropertyValue, 1007 NotImplemented, 1008 NotReady,
+            1009 ShuttingDown, 1010 SourceCreateFailed, 1011
+            BroadcastStateConflict, 1012 MediaNotSupported, 1013
+            ProfilesUnavailable (the profile verbs are standalone-only and
+            reject in managed mode), 1014 ProfileInvalid, 1015 ProfileNotFound.
+        message: { type: string }
+        data: { $ref: '#/components/schemas/ErrorData' }
+    ErrorData:
+      type: object
+      description: Optional structured error context.
+      properties:
+        category: { type: string, enum: [source, filter, audio, lifecycle, protocol] }
+        sourceId: { type: string }
+        filterId: { type: string }
+        property: { type: string, description: The offending settings key, when applicable. }
+        detail: { type: string }
+    ErrorEnvelope:
+      type: object
+      required: [id, error]
+      properties:
+        id:
+          description: >-
+            Echo of the request id; null when the request id could not be
+            parsed (-32700/-32600 cases).
+          oneOf:
+            - { type: integer }
+            - { type: string }
+            - { type: 'null' }
+        error: { $ref: '#/components/schemas/ErrorObject' }
+
+    # ----------------------------------------------------------- shared domain
+    SourceType:
+      type: string
+      description: >-
+        Product source-type vocabulary (closed set for contract v1; the live
+        set is advertised by GetVersion capabilities.sourceTypes).
+        camera = video capture device; display = monitor capture; window =
+        window capture; game = accelerated game capture; media = media
+        file/stream playback; image = still image; color = solid color
+        generator; text = text rendering; audio_input = audio input device
+        capture; audio_output = audio output (loopback) capture.
+      enum: [camera, display, window, game, media, image, color, text, audio_input, audio_output]
+    FilterKind:
+      type: string
+      enum: [video, audio]
+    SourceFormat:
+      type: string
+      description: >-
+        Pixel format of a source's Spout sender. srgb87 (the DEFAULT) = DXGI
+        B8G8R8A8_UNORM (87) carrying sRGB-encoded bytes -- correct for
+        receivers that decode sRGB once on import. linear87 = the same DXGI
+        87 container carrying linear bytes -- for receivers that perform no
+        sRGB decode; sRGB-decoding receivers will render it dark/wrong by
+        design. fp16 = DXGI R16G16B16A16_FLOAT (10), linear half-float HDR.
+        All formats carry alpha. Receivers can also read the actual format
+        from the Spout sender itself.
+      enum: [srgb87, linear87, fp16]
+    MediaState:
+      type: string
+      description: >-
+        Playback state of a media-capable source. none = the source has no
+        media pipeline (nothing opened yet); opening = the input is being
+        opened; buffering = playback stalled waiting on data; playing;
+        paused; stopped = halted with the position reset; ended = a
+        non-looping playback reached its end; error = the pipeline faulted.
+      enum: [none, opening, buffering, playing, paused, stopped, ended, error]
+    FilterInfo:
+      type: object
+      required: [filterId, filterType, name, kind, enabled, index]
+      properties:
+        filterId: { type: string }
+        filterType: { type: string }
+        name: { type: string, description: Display label; not unique. }
+        kind: { $ref: '#/components/schemas/FilterKind' }
+        enabled: { type: boolean }
+        index: { type: integer, description: Chain position; 0 applies first. }
+    SettingsObject:
+      type: object
+      description: >-
+        Plain key/value settings. Keys, value types, and constraints for a
+        given source/filter are discoverable via ListSourceProperties /
+        ListFilterProperties; unknown keys are rejected with 1006. Values are
+        JSON scalars (boolean, integer, number, string), except keys whose
+        descriptor type is 'font', which carry a FontValue object.
+      additionalProperties: true
+    FontValue:
+      type: object
+      description: >-
+        Value shape for settings keys whose PropertyDescriptor type is
+        'font'.
+      required: [face, size]
+      properties:
+        face: { type: string, description: Font family name. }
+        style: { type: string, description: 'Style name (e.g. Regular, Bold Italic); advisory -- some sources honor flags instead.' }
+        size: { type: integer }
+        flags:
+          type: integer
+          description: 'Style bitmask: 1 bold, 2 italic, 4 underline, 8 strikeout.'
+    SourceSummary:
+      type: object
+      required: [sourceId, type, displayName, senderName, broadcasting, format]
+      properties:
+        sourceId: { type: string, description: Server-generated opaque identity (stable per instance run). }
+        type: { $ref: '#/components/schemas/SourceType' }
+        displayName: { type: string, description: Human-readable label; not unique. }
+        senderName:
+          description: >-
+            ACTUAL registered Spout sender name (verbatim-bindable, identical
+            to the discovery file's sources[].name); null until resolved after
+            the source's first transmitted frame.
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+        broadcasting: { type: boolean }
+        format: { $ref: '#/components/schemas/SourceFormat' }
+        externalId:
+          description: >-
+            The client-supplied stable identifier echoed back verbatim, or null
+            when the source was created without one. Opaque to the helper; see
+            CreateSourceParams.externalId.
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+    SourceDetail:
+      allOf:
+        - $ref: '#/components/schemas/SourceSummary'
+        - type: object
+          required: [sends, lastSendOk, width, height]
+          properties:
+            sends: { type: integer, description: Frames successfully sent since attach. }
+            lastSendOk: { type: boolean, description: Whether the most recent send succeeded. }
+            width: { type: integer, description: Current source width in pixels (0 when not yet known). }
+            height: { type: integer, description: Current source height in pixels (0 when not yet known). }
+    InstanceState:
+      type: string
+      description: >-
+        starting = engine bring-up incomplete (rarely observable; the endpoint
+        normally opens after bring-up); ready = engine up, nothing
+        broadcasting; broadcasting = at least one source attached and sending;
+        error = engine fault.
+      enum: [starting, ready, broadcasting, error]
+    PropertyDescriptor:
+      type: object
+      required: [name, label, type, visible, enabled]
+      description: >-
+        Describes one settings key of a source or filter type. Only the
+        listed property types occur in contract v1; additional types may be
+        added in a minor revision.
+      properties:
+        name: { type: string, description: The settings key this descriptor describes. }
+        label: { type: string, description: Human-readable label. }
+        type:
+          type: string
+          enum: [bool, int, float, text, path, list, color, font, button]
+        visible: { type: boolean }
+        enabled: { type: boolean }
+        min: { type: number, description: int/float only. }
+        max: { type: number, description: int/float only. }
+        step: { type: number, description: int/float only. }
+        display:
+          type: string
+          enum: [slider, scroller]
+          description: int/float presentation hint.
+        textMode:
+          type: string
+          enum: [default, password, multiline, info]
+          description: text only.
+        pathMode:
+          type: string
+          enum: [file, directory]
+          description: path only.
+        pathFilter: { type: string, description: 'path only; file dialog filter, e.g. "*.png *.jpg".' }
+        listFormat:
+          type: string
+          enum: [int, float, string, bool]
+          description: list only; value type of items[].value.
+        listEditable: { type: boolean, description: list only; whether free-form values are allowed. }
+        items:
+          type: array
+          description: list only.
+          items: { $ref: '#/components/schemas/PropertyListItem' }
+        hasAlpha: { type: boolean, description: color only; whether the value carries an alpha channel. }
+    PropertyListItem:
+      type: object
+      required: [label, value]
+      properties:
+        label: { type: string }
+        value:
+          oneOf:
+            - { type: integer }
+            - { type: number }
+            - { type: string }
+            - { type: boolean }
+        disabled: { type: boolean, default: false }
+    AudioDevice:
+      type: object
+      required: [id, name, flow, isDefault]
+      properties:
+        id: { type: string, description: System endpoint id (opaque; pass to device-selection settings). }
+        name: { type: string }
+        flow: { type: string, enum: [render, capture] }
+        isDefault: { type: boolean }
+
+    # ----------------------------------------------------------- verb params/results
+    ShutdownParams:
+      type: object
+      description: Parameters for Shutdown.
+      additionalProperties: false
+      properties:
+        drain:
+          type: boolean
+          default: true
+          description: >-
+            true (default) = stop accepting new requests, frame-drain the
+            pipeline, then exit. false = immediate clean exit (skip the drain
+            wait) while still running the clean teardown chain.
+    ShutdownResult:
+      type: object
+      required: [accepted, drain]
+      additionalProperties: false
+      properties:
+        accepted: { const: true }
+        drain:
+          type: boolean
+          description: The effective drain mode this instance committed.
+        alreadyStopping:
+          type: boolean
+          description: >-
+            Present and true ONLY on a repeated Shutdown received while this
+            instance was already stopping (idempotent re-ack); absent on the
+            first Shutdown. When present, drain echoes the first committed value.
+    ProfileNameParams:
+      type: object
+      description: Parameters for LoadProfile / SaveProfile / DeleteProfile (standalone only).
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          description: >-
+            The profile name (a plain label, no path separators or the characters
+            / \ : * ? " < > |). Stored as <name>.json under the app's roaming
+            profiles directory.
+    ListProfilesResult:
+      type: object
+      required: [profiles, lastProfile]
+      additionalProperties: false
+      properties:
+        profiles:
+          type: array
+          items: { type: string }
+          description: Saved profile names, sorted case-insensitively.
+        lastProfile:
+          type: string
+          description: The last-loaded profile name (empty when none).
+    LoadProfileResult:
+      type: object
+      required: [name, fpsTier, sources]
+      additionalProperties: false
+      properties:
+        name: { type: string, description: The loaded profile name. }
+        fpsTier:
+          type: integer
+          description: >-
+            The now-running fps tier after the load (the profile's tier when it
+            triggered a live re-tier, else the unchanged running tier).
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/SourceSummary' }
+          description: The rebuilt source set (the load REPLACES the previous set).
+    SaveProfileResult:
+      type: object
+      required: [name, sources]
+      additionalProperties: false
+      properties:
+        name: { type: string, description: The saved profile name. }
+        sources: { type: integer, description: The number of sources captured in the profile. }
+    DeleteProfileResult:
+      type: object
+      required: [name, deleted]
+      additionalProperties: false
+      properties:
+        name: { type: string, description: The deleted profile name. }
+        deleted: { const: true }
+    GetVersionResult:
+      type: object
+      required: [version, apiVersion, instanceId, fpsTier, port, capabilities]
+      properties:
+        version: { type: string, description: Application semver. }
+        apiVersion: { type: integer, const: 1, description: Control-protocol version. }
+        instanceId: { type: string }
+        ownerId: { type: string, description: Opaque owner token advertised by this instance (empty = unowned). }
+        fpsTier: { type: integer }
+        port: { type: integer }
+        capabilities: { $ref: '#/components/schemas/Capabilities' }
+    Capabilities:
+      type: object
+      required: [sourceTypes, filterTypes, events, audioOutput]
+      properties:
+        sourceTypes:
+          type: array
+          items: { $ref: '#/components/schemas/SourceType' }
+        filterTypes:
+          type: array
+          description: >-
+            Filter-type names this instance can add (enumerated at runtime;
+            see ListAvailableFilters for kind/label detail).
+          items: { type: string }
+        events:
+          type: array
+          description: >-
+            Subscribable event names on this instance.
+          items: { type: string }
+        audioOutput:
+          type: boolean
+          description: >-
+            Whether audio output routing is available in this build. While
+            false, SetAudioOutputDevice replies 1007 NotImplemented; while
+            true, it is live.
+    GetStatusResult:
+      type: object
+      required: [state, instanceId, port, version, fpsTier, spoutPrefix, audioOutputDevice, fps, avgFrameMs, totalFrames, laggedFrames, publishedSenderNames, sources]
+      properties:
+        state: { $ref: '#/components/schemas/InstanceState' }
+        instanceId: { type: string }
+        port: { type: integer }
+        version: { type: string }
+        fpsTier: { type: integer }
+        spoutPrefix: { type: string, description: 'Sender-name prefix for this instance, e.g. MACHINE:Helper_7341.' }
+        audioOutputDevice: { type: string, description: "The stored audio output selection: 'default' or an endpoint id (the SetAudioOutputDevice read-back)." }
+        fps: { type: number, description: Achieved frames per second. }
+        avgFrameMs: { type: number, description: Average frame processing time in milliseconds. }
+        totalFrames: { type: integer }
+        laggedFrames: { type: integer }
+        publishedSenderNames:
+          type: array
+          description: >-
+            The ACTUAL Spout sender names this instance has published (engine slot
+            actualName where lastSendOk). Carries published-but-not-yet-live names:
+            a source appears here once its first frame has gone out, even before its
+            per-source senderName resolves into sources[]. This is the pre-live name
+            list a picker unions with the live Spout set.
+          items: { type: string }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/SourceDetail' }
+    ListSourcesResult:
+      type: object
+      required: [sources]
+      properties:
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/SourceSummary' }
+    SourceTypeInfo:
+      type: object
+      required: [type, label, hasVideo, hasAudio, hasMedia]
+      properties:
+        type: { $ref: '#/components/schemas/SourceType' }
+        label: { type: string, description: Human-readable display label for the type. }
+        hasVideo:
+          type: boolean
+          description: >-
+            The type produces video frames; a delivery frame rate is
+            meaningful for sources of this type.
+        hasAudio: { type: boolean, description: The type can contribute audio to the instance mix. }
+        hasMedia:
+          type: boolean
+          description: >-
+            The type supports media transport (GetMediaStatus / ControlMedia /
+            SeekMedia).
+    ListSourceTypesResult:
+      type: object
+      required: [sourceTypes]
+      properties:
+        sourceTypes:
+          type: array
+          description: >-
+            Creatable types on this instance, in the same order as GetVersion
+            capabilities.sourceTypes.
+          items: { $ref: '#/components/schemas/SourceTypeInfo' }
+    CreateSourceParams:
+      type: object
+      required: [type]
+      properties:
+        type: { $ref: '#/components/schemas/SourceType' }
+        displayName: { type: string, description: Label seed (also seeds the sender name); server-defaulted when omitted. }
+        settings: { $ref: '#/components/schemas/SettingsObject' }
+        startBroadcast: { type: boolean, default: false, description: Attach and start sending immediately. }
+        format: { $ref: '#/components/schemas/SourceFormat' }
+        gain: { type: number, minimum: 0, description: 'Initial linear gain multiplier (default 1.0); values above 20.0 are clamped.' }
+        muted: { type: boolean, default: false, description: Initial muted state. }
+        balance: { type: number, minimum: 0, maximum: 1, description: 'Initial stereo balance in [0,1] (default 0.5 = center).' }
+        syncOffsetMs: { type: integer, minimum: 0, description: 'Initial audio sync offset in milliseconds (default 0); values above 950 are clamped.' }
+        externalId:
+          description: >-
+            Optional client-supplied stable identifier, opaque to the helper:
+            the helper stores it verbatim and echoes it back unchanged in
+            SourceSummary (ListSources / CreateSource reply / GetStatus). It is
+            never interpreted, validated for uniqueness, or used by the helper;
+            it lets a control client deterministically re-adopt the same logical
+            source across reconnects (and, when carried in the boot config, across
+            instance restarts). Omitting it preserves legacy behavior (no field
+            is emitted).
+          oneOf:
+            - { type: string }
+            - { type: 'null' }
+    CreateSourceResult:
+      $ref: '#/components/schemas/SourceSummary'
+    RemoveSourceParams:
+      type: object
+      required: [sourceId]
+      properties:
+        sourceId: { type: string }
+    RemovedResult:
+      type: object
+      required: [removed]
+      properties:
+        removed: { type: boolean, const: true }
+    SetSourcePropertiesParams:
+      type: object
+      required: [sourceId, settings]
+      properties:
+        sourceId: { type: string }
+        settings: { $ref: '#/components/schemas/SettingsObject' }
+    SetSourcePropertiesResult:
+      type: object
+      required: [sourceId, applied]
+      properties:
+        sourceId: { type: string }
+        applied: { $ref: '#/components/schemas/SettingsObject' }
+        settings:
+          allOf:
+            - $ref: '#/components/schemas/SettingsObject'
+          description: Full post-apply state (additive; absent on older helpers).
+        properties:
+          type: array
+          items: { $ref: '#/components/schemas/PropertyDescriptor' }
+          description: Full post-apply state (additive; absent on older helpers).
+    ListSourcePropertiesParams:
+      type: object
+      required: [sourceId]
+      properties:
+        sourceId: { type: string }
+    ListPropertiesResult:
+      type: object
+      required: [properties, settings]
+      properties:
+        properties:
+          type: array
+          items: { $ref: '#/components/schemas/PropertyDescriptor' }
+        settings: { $ref: '#/components/schemas/SettingsObject' }
+    EnumerateSourceVariantsParams:
+      type: object
+      required: [type]
+      properties:
+        type: { $ref: '#/components/schemas/SourceType' }
+    EnumerateSourceVariantsResult:
+      type: object
+      required: [type, engineId, variants]
+      properties:
+        type: { $ref: '#/components/schemas/SourceType' }
+        engineId: { type: string, description: Engine type id backing this wire type. }
+        variants:
+          oneOf:
+            - $ref: '#/components/schemas/CameraVariantTree'
+            - $ref: '#/components/schemas/PropertyVariantList'
+          description: >-
+            Camera returns the device cascade (CameraVariantTree.devices). Every other type returns
+            the flat current-descriptor snapshot (PropertyVariantList.properties).
+    CameraVariantTree:
+      type: object
+      required: [devices]
+      properties:
+        devices:
+          type: array
+          items:
+            type: object
+            required: [id, name, resolutions]
+            properties:
+              id: { type: string, description: Device path id (engine video_device_id). }
+              name: { type: string }
+              resolutions:
+                type: array
+                items:
+                  type: object
+                  required: [value, fps, formats]
+                  properties:
+                    value: { type: string, description: 'Resolution as WxH, e.g. 1920x1080.' }
+                    fps:
+                      type: array
+                      items:
+                        type: object
+                        required: [label, value, interval]
+                        properties:
+                          label: { type: string }
+                          value: { type: number, description: Frames per second. }
+                          interval: { type: integer, description: 'Frame interval in 100ns units; fps = 10000000 / interval.' }
+                    formats:
+                      type: array
+                      items:
+                        type: object
+                        required: [label, value]
+                        properties:
+                          label: { type: string }
+                          value: { type: integer, description: Engine video format enum value. }
+    PropertyVariantList:
+      type: object
+      required: [properties]
+      properties:
+        properties:
+          type: array
+          items: { $ref: '#/components/schemas/PropertyDescriptor' }
+    ListAvailableFiltersParams:
+      type: object
+      properties:
+        sourceId: { type: string, description: Restrict to filters applicable to this source. }
+    ListAvailableFiltersResult:
+      type: object
+      required: [filters]
+      properties:
+        filters:
+          type: array
+          items:
+            type: object
+            required: [filterType, kind, label]
+            properties:
+              filterType: { type: string }
+              kind: { $ref: '#/components/schemas/FilterKind' }
+              label: { type: string }
+    AddFilterParams:
+      type: object
+      required: [sourceId, filterType]
+      properties:
+        sourceId: { type: string }
+        filterType: { type: string }
+        name: { type: string, description: Display label; defaults to the filter type label. Not unique. }
+        settings: { $ref: '#/components/schemas/SettingsObject' }
+    AddFilterResult:
+      type: object
+      required: [filterId, filterType, name]
+      properties:
+        filterId: { type: string, description: Server-generated opaque identity, scoped to the source. }
+        filterType: { type: string }
+        name: { type: string }
+    RemoveFilterParams:
+      type: object
+      required: [sourceId, filterId]
+      properties:
+        sourceId: { type: string }
+        filterId: { type: string }
+    SetFilterPropertiesParams:
+      type: object
+      required: [sourceId, filterId, settings]
+      properties:
+        sourceId: { type: string }
+        filterId: { type: string }
+        settings: { $ref: '#/components/schemas/SettingsObject' }
+    SetFilterPropertiesResult:
+      type: object
+      required: [filterId, applied]
+      properties:
+        filterId: { type: string }
+        applied: { $ref: '#/components/schemas/SettingsObject' }
+        settings:
+          allOf:
+            - $ref: '#/components/schemas/SettingsObject'
+          description: Full post-apply state (additive; absent on older helpers).
+        properties:
+          type: array
+          items: { $ref: '#/components/schemas/PropertyDescriptor' }
+          description: Full post-apply state (additive; absent on older helpers).
+    ListFilterPropertiesParams:
+      type: object
+      required: [sourceId, filterId]
+      properties:
+        sourceId: { type: string }
+        filterId: { type: string }
+    ListFiltersParams:
+      type: object
+      required: [sourceId]
+      properties:
+        sourceId: { type: string }
+    ListFiltersResult:
+      type: object
+      required: [filters]
+      properties:
+        filters:
+          type: array
+          description: Ordered by chain position (index 0 applies first).
+          items: { $ref: '#/components/schemas/FilterInfo' }
+    SetFilterEnabledParams:
+      type: object
+      required: [sourceId, filterId, enabled]
+      properties:
+        sourceId: { type: string }
+        filterId: { type: string }
+        enabled: { type: boolean }
+    SetFilterEnabledResult:
+      type: object
+      required: [filterId, enabled]
+      properties:
+        filterId: { type: string }
+        enabled: { type: boolean }
+    ReorderFilterParams:
+      type: object
+      required: [sourceId, filterId, index]
+      properties:
+        sourceId: { type: string }
+        filterId: { type: string }
+        index: { type: integer, minimum: 0, description: Target chain position; clamped to the valid range. }
+    ReorderFilterResult:
+      type: object
+      required: [filterId, index]
+      properties:
+        filterId: { type: string }
+        index: { type: integer, description: Effective position after the move. }
+    SetFilterNameParams:
+      type: object
+      required: [sourceId, filterId, name]
+      properties:
+        sourceId: { type: string }
+        filterId: { type: string }
+        name: { type: string, description: New display label; not required to be unique. }
+    SetFilterNameResult:
+      type: object
+      required: [filterId, name]
+      properties:
+        filterId: { type: string }
+        name: { type: string }
+    InvokeSourceButtonParams:
+      type: object
+      required: [sourceId, property]
+      properties:
+        sourceId: { type: string }
+        property: { type: string, description: The button property's settings key (descriptor name). }
+        filterId: { type: string, description: When present, invoke on this filter of the source instead. }
+    InvokedResult:
+      type: object
+      required: [invoked]
+      properties:
+        invoked: { type: boolean, const: true }
+    ListAudioDevicesParams:
+      type: object
+      properties:
+        flow:
+          type: string
+          enum: [render, capture]
+          description: Omitted returns both flows.
+    ListAudioDevicesResult:
+      type: object
+      required: [devices]
+      properties:
+        devices:
+          type: array
+          items: { $ref: '#/components/schemas/AudioDevice' }
+    SetAudioOutputDeviceParams:
+      type: object
+      required: [deviceId]
+      properties:
+        deviceId:
+          type: string
+          description: >-
+            An endpoint id from ListAudioDevices (flow render), or 'default'
+            to follow the system default render endpoint live.
+    SetAudioOutputDeviceResult:
+      type: object
+      required: [deviceId]
+      properties:
+        deviceId:
+          type: string
+          description: >-
+            The stored selection, echoed verbatim ('default' is never
+            resolved to a concrete endpoint id).
+    BroadcastParams:
+      type: object
+      properties:
+        sourceIds:
+          type: array
+          description: Named subset; absent or empty means all eligible sources.
+          items: { type: string }
+    StartBroadcastResult:
+      type: object
+      required: [broadcasting, started]
+      properties:
+        broadcasting: { type: boolean }
+        started:
+          type: array
+          items: { type: string }
+    StopBroadcastResult:
+      type: object
+      required: [broadcasting, stopped]
+      properties:
+        broadcasting: { type: boolean }
+        stopped:
+          type: array
+          items: { type: string }
+    SetSourceFormatParams:
+      type: object
+      required: [sourceId, format]
+      properties:
+        sourceId: { type: string }
+        format: { $ref: '#/components/schemas/SourceFormat' }
+    SetSourceFormatResult:
+      type: object
+      required: [sourceId, format]
+      properties:
+        sourceId: { type: string }
+        format: { $ref: '#/components/schemas/SourceFormat' }
+    GetMediaStatusParams:
+      type: object
+      required: [sourceId]
+      properties:
+        sourceId: { type: string }
+    GetMediaStatusResult:
+      type: object
+      required: [sourceId, state, positionMs, durationMs, looping]
+      properties:
+        sourceId: { type: string }
+        state: { $ref: '#/components/schemas/MediaState' }
+        positionMs: { type: integer, description: Current playback position in milliseconds. }
+        durationMs:
+          description: >-
+            Total duration in milliseconds; null while unknown (streams, or
+            media still opening).
+          oneOf:
+            - { type: integer }
+            - { type: 'null' }
+        looping: { type: boolean, description: "Mirrors the source's 'looping' setting (write it via SetSourceProperties)." }
+    ControlMediaParams:
+      type: object
+      required: [sourceId, action]
+      properties:
+        sourceId: { type: string }
+        action: { type: string, enum: [play, pause, restart, stop] }
+    ControlMediaResult:
+      type: object
+      required: [sourceId, state]
+      properties:
+        sourceId: { type: string }
+        state: { $ref: '#/components/schemas/MediaState' }
+    SeekMediaParams:
+      type: object
+      required: [sourceId, positionMs]
+      properties:
+        sourceId: { type: string }
+        positionMs: { type: integer, minimum: 0, description: 'Target position; clamped to [0, durationMs].' }
+    SeekMediaResult:
+      type: object
+      required: [sourceId, positionMs]
+      properties:
+        sourceId: { type: string }
+        positionMs: { type: integer, description: Effective position after the clamp. }
+    GetSourceAudioParams:
+      type: object
+      required: [sourceId]
+      properties:
+        sourceId: { type: string }
+    SetSourceAudioParams:
+      type: object
+      required: [sourceId]
+      description: At least one of gain, muted, balance, syncOffsetMs must be present (-32602 otherwise).
+      properties:
+        sourceId: { type: string }
+        gain:
+          type: number
+          minimum: 0
+          description: >-
+            Linear gain multiplier (1.0 = unity, 0.0 = silence). Values above
+            20.0 (about +26 dB) are clamped to 20.0; the reply echoes the
+            effective value.
+        muted: { type: boolean, description: 'Silences the source''s contribution while true; gain is preserved.' }
+        balance:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: >-
+            Stereo balance; 0.5 = center (sine-law panning; values within
+            0.49-0.51 behave as exact center).
+        syncOffsetMs:
+          type: integer
+          minimum: 0
+          description: >-
+            Positive-only audio delay in milliseconds for A/V alignment
+            against the live-relayed video (audio plays this much LATER; 0 =
+            no delay). Values above 950 are clamped to 950; the reply echoes
+            the effective value. A live change splices with a ~5 ms fade: an
+            increase inserts that much silence (the added delay
+            materializing), a decrease skips that much content. For the
+            audio-earlier direction, delay the VIDEO instead (the
+            render_delay / video_delay filters).
+    SourceAudioResult:
+      type: object
+      required: [sourceId, gain, muted, balance, syncOffsetMs]
+      properties:
+        sourceId: { type: string }
+        gain: { type: number, description: Effective linear gain multiplier (1.0 = unity). }
+        muted: { type: boolean }
+        balance: { type: number, description: 'Stereo balance in [0,1]; 0.5 = center.' }
+        syncOffsetMs: { type: integer, description: 'Effective audio sync offset in milliseconds (0 = no delay).' }
+    SetSourceIdleModeParams:
+      type: object
+      required: [sourceId, releaseWhenIdle]
+      additionalProperties: false
+      properties:
+        sourceId: { type: string }
+        releaseWhenIdle:
+          type: boolean
+          description: >-
+            When true, the helper releases the exclusive capture device while the source is idle
+            (no broadcast consumer attached), reacquiring it on the next StartBroadcast. When false
+            (the default -- always-live), the source holds the device continuously. Behaviorally
+            observable only on device-holding types (camera, audio_input, audio_output); a recorded
+            no-op on the other types. The helper applies this generically to camera + audio input/output.
+        disabled:
+          type: boolean
+          description: >-
+            Optional HARD override (additive, back-compat). When true, the device is released and no
+            frames are produced regardless of idle state or placement; takes precedence over
+            releaseWhenIdle. Omitting it leaves the current disabled state unchanged.
+    SetSourceIdleModeResult:
+      type: object
+      required: [sourceId, releaseWhenIdle]
+      additionalProperties: false
+      properties:
+        sourceId: { type: string }
+        releaseWhenIdle: { type: boolean, description: Effective state after the update. }
+        disabled: { type: boolean, description: Effective hard-disable state after the update. }
+    SubscribeParams:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          minItems: 1
+          description: >-
+            Event names. Subscribable names: status, sourceAdded,
+            sourceRemoved, filterAdded, filterRemoved, filterChanged,
+            propertyChanged, mediaChanged, audioChanged, audioLevels,
+            sourceIdleModeChanged, senderNameResolved, broadcastChanged.
+            instanceShuttingDown is not subscribable -- it is always delivered.
+          items: { type: string }
+    SubscribeResult:
+      type: object
+      required: [subscribed]
+      properties:
+        subscribed:
+          type: array
+          items: { type: string }
+    UnsubscribeResult:
+      type: object
+      required: [unsubscribed]
+      properties:
+        unsubscribed:
+          type: array
+          items: { type: string }
+
+    # ----------------------------------------------------------- event envelopes
+    StatusEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: status }
+        data:
+          type: object
+          required: [instanceId, ts, state, fps, avgFrameMs, totalFrames, laggedFrames, sources]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer, description: Unix epoch milliseconds. }
+            state: { $ref: '#/components/schemas/InstanceState' }
+            fps: { type: number }
+            avgFrameMs: { type: number }
+            totalFrames: { type: integer }
+            laggedFrames: { type: integer }
+            sources:
+              type: array
+              items:
+                type: object
+                required: [sourceId, senderName, broadcasting, lastSendOk]
+                properties:
+                  sourceId: { type: string }
+                  senderName:
+                    oneOf:
+                      - { type: string }
+                      - { type: 'null' }
+                  broadcasting: { type: boolean }
+                  lastSendOk: { type: boolean }
+    SourceAddedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: sourceAdded }
+        data:
+          type: object
+          required: [instanceId, ts, source]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            source: { $ref: '#/components/schemas/SourceSummary' }
+    SourceRemovedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: sourceRemoved }
+        data:
+          type: object
+          required: [instanceId, ts, sourceId]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId: { type: string }
+    SenderNameResolvedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: senderNameResolved }
+        data:
+          type: object
+          required: [instanceId, ts, sourceId, senderName]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId: { type: string }
+            senderName: { type: string }
+    BroadcastChangedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: broadcastChanged }
+        data:
+          type: object
+          required: [instanceId, ts, sourceId, broadcasting]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId:
+              description: Per-source transition; null for instance-wide.
+              oneOf:
+                - { type: string }
+                - { type: 'null' }
+            broadcasting: { type: boolean }
+    SourceIdleModeChangedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: sourceIdleModeChanged }
+        data:
+          type: object
+          required: [instanceId, ts, sourceId, releaseWhenIdle]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId: { type: string }
+            releaseWhenIdle: { type: boolean }
+    FilterAddedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: filterAdded }
+        data:
+          type: object
+          required: [instanceId, ts, sourceId, filter]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId: { type: string }
+            filter: { $ref: '#/components/schemas/FilterInfo' }
+    FilterRemovedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: filterRemoved }
+        data:
+          type: object
+          required: [instanceId, ts, sourceId, filterId]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId: { type: string }
+            filterId: { type: string }
+    FilterChangedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: filterChanged }
+        data:
+          type: object
+          description: At least one of name/enabled/index is present.
+          required: [instanceId, ts, sourceId, filterId]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId: { type: string }
+            filterId: { type: string }
+            name: { type: string }
+            enabled: { type: boolean }
+            index: { type: integer }
+    PropertyChangedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: propertyChanged }
+        data:
+          type: object
+          required: [instanceId, ts, sourceId, applied]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId: { type: string }
+            filterId: { type: string, description: Present when the change was filter-scoped. }
+            applied: { $ref: '#/components/schemas/SettingsObject' }
+            settings:
+              allOf:
+                - $ref: '#/components/schemas/SettingsObject'
+              description: Full post-apply state (additive; absent on older helpers).
+            properties:
+              type: array
+              items: { $ref: '#/components/schemas/PropertyDescriptor' }
+              description: Full post-apply state (additive; absent on older helpers).
+    MediaChangedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: mediaChanged }
+        data:
+          type: object
+          required: [instanceId, ts, sourceId, state]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId: { type: string }
+            state: { $ref: '#/components/schemas/MediaState' }
+            positionMs: { type: integer, description: Included where the engine reports a position. }
+    AudioChangedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: audioChanged }
+        data:
+          type: object
+          description: At least one of gain/muted/balance/syncOffsetMs is present.
+          required: [instanceId, ts, sourceId]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            sourceId: { type: string }
+            gain: { type: number }
+            muted: { type: boolean }
+            balance: { type: number }
+            syncOffsetMs: { type: integer }
+    AudioLevelsEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: audioLevels }
+        data:
+          type: object
+          required: [instanceId, ts, master, sources]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            master:
+              type: object
+              required: [peak, rms, clipped]
+              properties:
+                peak: { type: number, description: 'Linear peak level of the summed mix since the previous emit, measured before the output clamp.' }
+                rms: { type: number, description: Linear RMS level of the summed mix over the emission window. }
+                clipped: { type: boolean, description: Whether the output clamp engaged since the previous emit. }
+            sources:
+              type: array
+              description: Currently broadcasting audio-contributing sources.
+              items:
+                type: object
+                required: [sourceId, peak, rms]
+                properties:
+                  sourceId: { type: string }
+                  peak: { type: number, description: 'Linear peak level, post gain/mute.' }
+                  rms: { type: number, description: 'Linear RMS level, post gain/mute.' }
+    InstanceShuttingDownEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: instanceShuttingDown }
+        data:
+          type: object
+          required: [instanceId, ts, reason]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            reason: { type: string, enum: [shutdown, restart, fault] }
+            graceMs:
+              description: Hint for how long senders may remain registered; null when unknown.
+              oneOf:
+                - { type: integer }
+                - { type: 'null' }

@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ToxMox / MoxRelay contributors
+//
+// Win32 VERSIONINFO resource TEMPLATE (configure_file @ONLY input). CMake substitutes the
+// @-delimited placeholders at configure time from the version SINGLE SOURCE OF TRUTH (kMoxRelayVersion in
+// src/app/HelperConfig.hpp) so the metadata shown in Explorer -> Properties -> Details
+// (ProductName / CompanyName / FileVersion / Copyright) can NEVER drift from what the binary
+// reports. Do NOT hardcode version numbers here -- bump kMoxRelayVersion and this follows.
+//
+// The binary FILEVERSION/PRODUCTVERSION fields are 4 numeric WORDs; the pre-release milestone
+// suffix ("-mN") has no numeric slot, so the 4th field is 0 and the human-readable "-mN" rides
+// in the FileVersion/ProductVersion STRING values below. The LegalCopyright VALUE names the
+// signing entity (CrunchFocus LLC) per project decision; source contributor attribution stays
+// in this header comment.
+1 VERSIONINFO
+FILEVERSION    @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "CrunchFocus LLC"
+            VALUE "FileDescription",  "MoxRelay"
+            VALUE "FileVersion",      "@MOXRELAY_VERSION_FULL@"
+            VALUE "InternalName",     "moxrelay"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 CrunchFocus LLC"
+            VALUE "OriginalFilename", "moxrelay.exe"
+            VALUE "ProductName",      "MoxRelay"
+            VALUE "ProductVersion",   "@MOXRELAY_VERSION_FULL@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 0x04B0
+    END
+END

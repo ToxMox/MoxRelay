@@ -1,0 +1,5 @@
+# clangd reads compile commands from the Ninja sidecar configure
+# (cmake --preset clangd); the real build uses the Visual Studio
+# generator, which cannot export a compilation database.
+CompileFlags:
+  CompilationDatabase: cmake-build-clangd

@@ -1,0 +1,30 @@
+Microsoft Visual C++ Runtime -- Redistribution Notice
+=====================================================
+
+This package redistributes the Microsoft Visual C++ runtime libraries that are
+required to run an application built with the Microsoft Visual C++ compiler.
+The redistributed files are the Microsoft "Distributable Code" Visual C++
+runtime DLLs, which ship side by side with the application executable:
+
+    vcruntime140.dll
+    vcruntime140_1.dll
+    msvcp140.dll
+    concrt140.dll
+    (and any related Visual C++ runtime DLLs pulled in by the build)
+
+These files are Microsoft software. They are NOT covered by the GNU GPL that
+governs the rest of this package; they are redistributed under the Microsoft
+Visual C++ Redistributable / Visual Studio "Distributable Code" terms that
+accompany the Microsoft Visual Studio installation used to build this software.
+
+The authoritative redistribution terms and the current list of redistributable
+files are published by Microsoft at:
+
+    https://aka.ms/vs/17/redist.txt        (Visual Studio 2022 redist list)
+    https://visualstudio.microsoft.com/license-terms/
+
+Users who prefer not to receive these DLLs inside the package may instead
+install the official Microsoft Visual C++ Redistributable for Visual Studio
+2015-2022 (x64) from Microsoft:
+
+    https://aka.ms/vs/17/release/vc_redist.x64.exe

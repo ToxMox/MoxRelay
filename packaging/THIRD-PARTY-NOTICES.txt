@@ -1,0 +1,222 @@
+===============================================================================
+THIRD-PARTY SOFTWARE NOTICES AND LICENSE INDEX
+===============================================================================
+
+OVERALL LICENSE
+---------------
+This software as a whole is licensed under the GNU General Public License,
+version 3 or later (GPLv3-or-later). The full GPLv3 text is the LICENSE file
+that ships at the root of this package. The work links GPL-licensed components
+(libobs, a GPL FFmpeg build and x264), so the combined binary is conveyed
+under the GPL.
+
+The complete corresponding source for the GPL/LGPL parts, the pinned upstream
+revisions, and a three-year written offer are in SOURCES.txt (next to this
+file).
+
+This package redistributes the third-party components listed below. Each
+component's verbatim license text is stored under licenses/<component>/.
+File paths in this index are relative to the package root.
+
+
+COMPONENT INDEX
+---------------
+
+| Component        | License                         | License text |
+|-|-|-|
+| (this app)       | GPLv3-or-later                  | LICENSE (package root) |
+| libobs / OBS     | GPLv2-or-later                  | licenses/libobs/COPYING |
+| OBS plugins (7)  | GPLv2-or-later (part of OBS)    | licenses/libobs/COPYING |
+| FFmpeg (GPL)     | GPLv2-or-later                  | licenses/FFmpeg/COPYING.GPLv2 |
+| x264 (GPL)       | GPLv2-or-later                  | licenses/x264/COPYING, licenses/x264/AUTHORS |
+| Qt 6             | LGPLv3 (dynamically linked)     | licenses/Qt6/LICENSE.LGPL3 |
+| libcurl          | curl license (MIT/X-style)      | licenses/curl/COPYING |
+| librist          | BSD-2-Clause                    | licenses/librist/COPYING |
+| libsrt           | MPL-2.0                         | licenses/libsrt/LICENSE |
+| libdatachannel   | MPL-2.0 (+ sublicensed deps)    | licenses/libdatachannel/LICENSE |
+| LuaJIT           | MIT                             | licenses/luajit/COPYRIGHT |
+| zlib             | zlib license                    | licenses/zlib/README |
+| MSVC C++ runtime | Microsoft VC++ Redistributable  | licenses/msvc-runtime/REDIST.txt |
+| Spout2           | BSD-2-Clause (static)           | licenses/Spout2/LICENSE |
+| IXWebSocket      | BSD-3-Clause (static)           | licenses/IXWebSocket/LICENSE.txt |
+| nlohmann/json    | MIT (static, header-only)       | licenses/nlohmann-json/LICENSE.MIT |
+
+
+NOTES
+-----
+
+OBS plugins (7)
+    The bundled OBS plugins shipped under obs-plugins/ are image-source,
+    obs-ffmpeg, obs-filters, obs-text, win-capture, win-dshow and win-wasapi.
+    They are part of OBS Studio and share its GPLv2-or-later license and
+    corresponding source.
+
+FFmpeg / x264
+    These are GPL-enabled builds. They make the binary as a whole GPL. See
+    SOURCES.txt for the pinned versions and corresponding source.
+
+Qt 6 (LGPLv3, dynamically linked)
+    Qt is used as unmodified, dynamically-linked shared libraries (Qt6Core,
+    Qt6Gui, Qt6Widgets and the qwindows platform plugin). These DLLs ship side
+    by side with the executable and may be replaced by the user with an
+    interface-compatible build of Qt 6, which satisfies the LGPLv3 relinking
+    right (LGPLv3 section 4). LGPLv3 incorporates GPLv3 by reference; the GPLv3
+    text is the root LICENSE file. See licenses/Qt6/LICENSE.LGPL3.
+
+libsrt (MPL-2.0)
+    Upstream  : https://github.com/Haivision/srt
+    Copyright (c) 2018 Haivision Systems Inc.
+
+    A standalone Secure Reliable Transport (SRT) streaming library supplied
+    by the obs-deps bundle and shipped as srt.dll next to the executable.
+    Licensed under the Mozilla Public License, Version 2.0. The full MPL-2.0
+    text ships at licenses/libsrt/LICENSE; a copy can also be obtained at
+    https://mozilla.org/MPL/2.0/.
+
+libdatachannel
+    Licensed under MPL-2.0 (licenses/libdatachannel/LICENSE). The prebuilt
+    libdatachannel binary statically bundles its own dependencies (libjuice,
+    libsrtp, usrsctp, plog, nlohmann/json); their verified per-dependency
+    notices are reproduced in the LIBDATACHANNEL BUNDLED DEPENDENCIES section
+    below.
+
+MSVC C++ runtime
+    The Microsoft Visual C++ runtime DLLs (vcruntime140, vcruntime140_1,
+    msvcp140, concrt140 and related) are redistributed under the Microsoft
+    Visual C++ Redistributable terms. See licenses/msvc-runtime/REDIST.txt.
+
+Static components (Spout2, IXWebSocket, nlohmann/json)
+    These are compiled directly into the application executable. Their
+    permissive licenses (BSD / MIT) require that their copyright and license
+    notices be reproduced in distributions; that is the purpose of the texts
+    under licenses/.
+
+
+LIBDATACHANNEL BUNDLED DEPENDENCIES
+-----------------------------------
+
+The libdatachannel binary redistributed here is the obs-deps build of
+libdatachannel v0.21.0 (commit 9d5c46b8f506943727104d766e5dad0693c5a223;
+https://github.com/paullouisageneau/libdatachannel). libdatachannel is
+licensed under MPL-2.0 (licenses/libdatachannel/LICENSE) and statically
+bundles the dependencies listed below. Their source is not vendored in this
+package; each dependency's upstream project and the notice its license
+requires for binary redistribution are reproduced here. nlohmann/json is also
+bundled by libdatachannel, but it already appears in the component index
+above and its MIT text ships at licenses/nlohmann-json/LICENSE.MIT.
+
+libjuice (MPL-2.0)
+    Upstream  : https://github.com/paullouisageneau/libjuice
+    Copyright (c) 2020-2022 Paul-Louis Ageneau
+
+    Licensed under the Mozilla Public License, Version 2.0. The full MPL-2.0
+    text is the same license that ships at licenses/libdatachannel/LICENSE; a
+    copy can also be obtained at https://mozilla.org/MPL/2.0/.
+
+libsrtp (BSD-3-Clause)
+    Upstream  : https://github.com/cisco/libsrtp
+    Copyright (c) 2001-2017 Cisco Systems, Inc.
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+
+      Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+      Redistributions in binary form must reproduce the above
+      copyright notice, this list of conditions and the following
+      disclaimer in the documentation and/or other materials provided
+      with the distribution.
+
+      Neither the name of the Cisco Systems, Inc. nor the names of its
+      contributors may be used to endorse or promote products derived
+      from this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+    INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+    HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+    STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+    OF THE POSSIBILITY OF SUCH DAMAGE.
+
+usrsctp (BSD-3-Clause)
+    Upstream  : https://github.com/sctplab/usrsctp
+    Copyright (c) 2015,  Randall Stewart and Michael Tuexen
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+      * Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+
+      * Redistributions in binary form must reproduce the above copyright
+        notice, this list of conditions and the following disclaimer in
+        the documentation and/or other materials provided with the
+        distribution.
+
+      * Neither the name of usrsctp nor the names of its contributors may
+        be used to endorse or promote products derived from this software
+        without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+    A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+    HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+    LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+    DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+plog (MIT)
+    Upstream  : https://github.com/SergiusTheBest/plog
+    Copyright (c) 2022 Sergey Podobry
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+PORTED / DERIVED SOURCE CODE
+----------------------------
+
+Some of this application's source files contain code ported or derived from a
+third-party project, rather than redistributing a prebuilt binary. They are
+recorded here for provenance. No additional license text is introduced: the
+upstream license already shipped under licenses/ governs the derived code.
+
+src/ui/MoxDisplayWidget.cpp, src/ui/MoxDisplayWidget.hpp
+    Contain code ported/derived from the OBS Studio frontend (the OBSQTDisplay
+    native-surface display widget, the OBSProjector single-source draw path,
+    and the Multiview / display-helpers letterbox utilities). That upstream
+    code is GPLv2-or-later, which is compatible with this application's
+    GPLv3-or-later license. Upstream: obsproject/obs-studio. See
+    licenses/libobs/COPYING for the license text and the OBS Studio entry in
+    SOURCES.txt for the pinned corresponding source.

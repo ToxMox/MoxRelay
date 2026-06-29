@@ -1,0 +1,22 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- MoxRelay Qt resource bundle: embedded QSS dark theme (:/theme/dark.qss) and the application
+     icon as multi-resolution PNGs (:/icons/moxrelay-*.png). PNG is built into QtGui, so these load
+     with no imageformats plugin deployed; the .ico/.svg masters are NOT embedded (the .ico is the
+     Win32 exe-icon resource; the .svg is the vector master). -->
+<RCC>
+    <qresource prefix="/theme">
+        <file alias="dark.qss">theme/dark.qss</file>
+        <file alias="arrow-down.png">theme/arrow-down.png</file>
+        <file alias="arrow-down-disabled.png">theme/arrow-down-disabled.png</file>
+        <file alias="arrow-up.png">theme/arrow-up.png</file>
+        <file alias="arrow-up-disabled.png">theme/arrow-up-disabled.png</file>
+    </qresource>
+    <qresource prefix="/icons">
+        <file alias="moxrelay-16.png">icons/moxrelay-16.png</file>
+        <file alias="moxrelay-32.png">icons/moxrelay-32.png</file>
+        <file alias="moxrelay-48.png">icons/moxrelay-48.png</file>
+        <file alias="moxrelay-64.png">icons/moxrelay-64.png</file>
+        <file alias="moxrelay-128.png">icons/moxrelay-128.png</file>
+        <file alias="moxrelay-256.png">icons/moxrelay-256.png</file>
+    </qresource>
+</RCC>

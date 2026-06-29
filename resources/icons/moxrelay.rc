@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ToxMox / MoxRelay contributors
+//
+// Win32 application-icon resource. The lowest-numbered ICON resource is what Windows Explorer,
+// the taskbar, and Alt-Tab use for moxrelay.exe ITSELF -- this is independent of (and present
+// even before) the runtime QApplication::setWindowIcon. The icon path is resolved relative to
+// this .rc file, so moxrelay.ico must sit beside it in resources/icons/.
+//
+// Source artwork: moxrelay.svg (vector master) -> moxrelay.ico (multi-res 16/32/48/256).
+1 ICON "moxrelay.ico"

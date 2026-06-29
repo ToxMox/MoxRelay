@@ -1,0 +1,25 @@
+{
+  "instances": [
+    {
+      "instanceId": "tier-60",
+      "fpsTier": 60,
+      "port": 7341,
+      "sources": [
+        { "id": "monitor_capture", "name": "Desktop",
+          "externalId": "demo-desktop-7b3f9c1e",
+          "settings": { "method": 0, "capture_cursor": true } },
+        { "id": "color_source_v3", "name": "ColorA",
+          "settings": { "color": 4280303808, "width": 640, "height": 360 } }
+      ]
+    },
+    {
+      "instanceId": "tier-240",
+      "fpsTier": 240,
+      "port": 7342,
+      "sources": [
+        { "id": "color_source_v3", "name": "FastColor",
+          "settings": { "color": 4278255360, "width": 320, "height": 240 } }
+      ]
+    }
+  ]
+}

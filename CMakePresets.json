@@ -1,0 +1,49 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "msvc-x64",
+      "displayName": "MSVC x64 (VS2022 / v143, RelWithDebInfo)",
+      "description": "Pinned VS2022 v143 toolset (VS2026/v18 resolves via vswhere but is NOT OBS-validated). Absolute paths (OBS_SRC/OBS_BUILD/CMAKE_PREFIX_PATH/MOXRELAY_OBS_RUNDIR) come from the git-ignored CMakeUserPresets.json.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "toolset": "v143",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "OBS_CONFIG": "RelWithDebInfo",
+        "OBS_SRC": "",
+        "OBS_BUILD": "",
+        "MOXRELAY_OBS_RUNDIR": "",
+        "CMAKE_PREFIX_PATH": ""
+      }
+    },
+    {
+      "name": "clangd-base",
+      "hidden": true,
+      "displayName": "clangd compilation database fragment (Ninja sidecar; configure-only)",
+      "description": "Emits cmake-build-clangd/compile_commands.json for clangd; the VS generator cannot (CMAKE_EXPORT_COMPILE_COMMANDS is a no-op there). Combine with your local-paths preset in CMakeUserPresets.json, e.g. inherits [\"clangd-base\", \"local\"], and configure from a VS dev shell. Never built -- the real build keeps the VS generator. The repo-root .clangd file points clangd at the sidecar directory.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-clangd",
+      "architecture": { "value": "x64", "strategy": "external" },
+      "toolset": { "value": "v143", "strategy": "external" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_CXX_SCAN_FOR_MODULES": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "msvc-x64",
+      "displayName": "Build MoxRelay (RelWithDebInfo)",
+      "configurePreset": "msvc-x64",
+      "configuration": "RelWithDebInfo"
+    }
+  ]
+}

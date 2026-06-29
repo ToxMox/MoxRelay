@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_2" data-name="Layer 2" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 227.2 227.2">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: #ff2166;
+      }
+
+      .cls-2 {
+        fill: #6b0088;
+        stroke: url(#linear-gradient);
+        stroke-width: 26px;
+      }
+
+      .cls-2, .cls-3 {
+        stroke-miterlimit: 10;
+      }
+
+      .cls-3 {
+        fill: none;
+        stroke: #fff;
+        stroke-width: 20px;
+      }
+    </style>
+    <linearGradient id="linear-gradient" x1="0" y1="113.6" x2="227.2" y2="113.6" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff23a"/>
+      <stop offset=".04" stop-color="#fee52c"/>
+      <stop offset=".12" stop-color="#fdd41a"/>
+      <stop offset=".2" stop-color="#fdc90e"/>
+      <stop offset=".28" stop-color="#fdc60b"/>
+      <stop offset=".67" stop-color="#f28f3f"/>
+      <stop offset=".89" stop-color="#ed693c"/>
+      <stop offset="1" stop-color="#e83e39"/>
+    </linearGradient>
+  </defs>
+  <g id="Layer_1_copy" data-name="Layer 1 copy">
+    <path class="cls-2" d="M113.6,13C58.1,13,13,58.1,13,113.6s45.1,100.6,100.6,100.6,100.6-45.1,100.6-100.6S169.1,13,113.6,13h0Z"/>
+    <path class="cls-3" d="M76.23,92.82c3.52-9.49,15.48-15.76,22.52-20.49,34.67-23.33,73.67,13.99,17.43,43.23-60.4,31.4-11.76,62.11,26.05,34.11"/>
+    <circle class="cls-1" cx="154.36" cy="144.99" r="24.99"/>
+    <circle class="cls-1" cx="75.2" cy="81.31" r="24.99"/>
+  </g>
+</svg>
