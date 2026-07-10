@@ -26,7 +26,9 @@
 
 #include <obs.h>
 
+#include <chrono>
 #include <functional>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -206,6 +208,23 @@ public:
 	// thread and re-evaluates the source's media state there (diff-emit mediaChanged).
 	void notifyMediaSignal(const std::string &sourceId);
 
+	// Present video-capture device set: deviceId -> friendly name. The unit the arrival watch diffs
+	// and the self-heal predicate tests membership against.
+	using DeviceSnapshot = std::map<std::string, std::string>;
+
+	// Device-arrival self-heal seam (MAIN THREAD only). Driven by DeviceArrivalWatch (a debounced OS
+	// device-notification poke, plus a one-shot post-start baseline poke): (1) enumerate the present
+	// video-capture devices via the injected provider; (2) diff against the previous snapshot and emit
+	// `devicesChanged` on a non-empty diff -- NEVER on the first (baseline) snapshot, which only
+	// establishes the reference set; (3) run a stateless self-heal pass that force-restarts any camera
+	// source which should be live but is producing no frames and whose saved device is present (the
+	// standard propertyChanged echo then tells every client). Healthy sources are never touched.
+	void refreshDeviceSnapshotAndHeal();
+
+	// Inject the device-snapshot provider. The self-test replaces it to drive the diff/heal paths with
+	// NO hardware; left unset in production, snapshots come from the real type-only enumeration.
+	void setDeviceSnapshotProvider(std::function<DeviceSnapshot()> provider);
+
 private:
 	struct FilterRec {
 		std::string filterId;
@@ -224,6 +243,11 @@ private:
 		int slotId = -1;                 // engine slot while broadcasting; -1 otherwise
 		std::string senderName;          // actual resolved name ("" = null on the wire)
 		bool senderAnnounced = false;    // senderNameResolved fired for the current attach
+		// Sticky sender name (the allocator reservation this record OWNS): captured at every
+		// attach, kept across broadcast detach/attach so a re-attach publishes the SAME name,
+		// released ONLY at RemoveSource / instance teardown (name stability for any name-keyed
+		// consumer). Never on the wire -- clients see senderName/senderNameResolved as before.
+		std::string allocatedSenderName;
 		uint64_t sends = 0;              // last engine snapshot
 		bool lastSendOk = false;
 		bool initFailed = false;
@@ -235,6 +259,21 @@ private:
 		bool releaseWhenIdle = false;    // Phase 2: drop the showing ref while idle (device released)
 		bool disabled        = false;    // Phase 2: hard override -- device released + no frames while on
 		bool deviceShowing   = true;     // tracks the single showing ref this helper holds for the source
+
+		// Self-heal discipline (main thread; see refreshDeviceSnapshotAndHeal). The stateless frameless
+		// restart is rate-limited by a MONOTONIC cooldown since this source's last heal attempt AND a
+		// consecutive-fruitless-attempt cap; arrival-triggered heals reset the streak and bypass the
+		// cap, but a FRUITLESS arrival (no frames observed since the last attempt) still honors the
+		// cooldown -- a flapping device must not restore the per-flap restart cadence.
+		// healLastAttempt is a steady_clock stamp (never wall clock); healEverAttempted gates the first
+		// pass (no prior stamp => cooldown does not apply); healFruitlessCount counts consecutive heal
+		// attempts that did NOT yield frames (reset on observed nonzero dimensions or a new arrival);
+		// healSeenFramesSinceAttempt records that nonzero dimensions were observed since the last heal
+		// attempt (a productive spell => the next arrival heal is immediate).
+		std::chrono::steady_clock::time_point healLastAttempt{};
+		bool healEverAttempted = false;
+		int  healFruitlessCount = 0;
+		bool healSeenFramesSinceAttempt = false;
 
 		// Property-enumeration cache (the dshow-camera settings-UI freeze fix). obs_source_properties
 		// on a camera is the ~1s cost (EnumVideoDevices does one BindToObject per device), so it is run
@@ -261,6 +300,20 @@ private:
 	void refreshSourcePropsCache(SourceRec &rec);
 	static bool sourceCascadeKeysAudited(const std::string &wireType);
 	static bool isCascadeKey(const std::string &key);
+
+	// The post-update sequence shared by the wire SetSourceProperties path and the device-arrival
+	// self-heal: inert-until-configured activation, the descriptor-cache refresh (cascade path), the
+	// standard propertyChanged echo emission, and returning that echo. `settings` selects the keys that
+	// appear in the echo's `applied` map (each keyed to its post-update stored value, falling back to
+	// the submitted value). `plainToggle` replays the cached descriptors verbatim (no enumeration);
+	// otherwise an audited type refreshes the cache and a non-audited type enumerates live. Extracted so
+	// the self-heal path reuses the EXACT wire echo shape without duplicating it.
+	nlohmann::json emitPropertyChangedEcho(SourceRec &rec, const nlohmann::json &settings, bool plainToggle);
+
+	// The real device-snapshot provider: a type-only enumeration of the dshow camera input's
+	// video_device_id list (present set). Mirrors the EnumerateSourceVariants device-list walk, minus
+	// the resolution/fps cascade. Never creates or touches a live source.
+	static DeviceSnapshot enumerateVideoCaptureDevices();
 
 	// True only for source types whose engine holds an exclusive HW capture device.
 	bool sourceHoldsExclusiveDevice(const SourceRec &rec);
@@ -364,6 +417,13 @@ private:
 	std::vector<SourceRec> recs_; // insertion order (boot order, then creation order)
 	int nextSourceNum_ = 1;
 	bool released_ = false;
+
+	// Device-arrival self-heal state (main thread). deviceSnapshotProvider_ unset => real enumeration.
+	// deviceSnapshot_ is the last-seen present device set; haveDeviceSnapshot_ gates the baseline (the
+	// first snapshot emits no devicesChanged -- it only establishes the reference set).
+	std::function<DeviceSnapshot()> deviceSnapshotProvider_;
+	DeviceSnapshot deviceSnapshot_;
+	bool haveDeviceSnapshot_ = false;
 };
 
 } // namespace moxrelay

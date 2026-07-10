@@ -209,7 +209,7 @@ const char *SpoutSenderEngine::formatName(SenderFormat format)
 }
 
 int SpoutSenderEngine::attach(obs_source_t *source, const std::string &machine, int port,
-			      const std::string &sourceName, SenderFormat format)
+			      const std::string &sourceName, SenderFormat format, const std::string &stickyName)
 {
 	if (!source || sourceName.empty())
 		return -1;
@@ -227,16 +227,20 @@ int SpoutSenderEngine::attach(obs_source_t *source, const std::string &machine, 
 	// probe "free" and collide without the local reservation.
 	std::string requested;
 	std::string resolved;
+	bool wasSticky = false;
 	if (!audioOnly) {
 		requested = SpoutNaming::makeSenderName(machine, port, sourceName);
-		resolved = allocator_.resolve(machine, port, sourceName);
+		// Sticky re-attach: a record that already owns a reservation publishes under the SAME
+		// name (name stability for name-keyed consumers); otherwise resolve fresh. `wasSticky`
+		// is the explicit path flag -- the rollback discriminator below.
+		resolved = allocator_.resolve(machine, port, sourceName, stickyName, &wasSticky);
 		if (resolved.empty()) {
 			std::fprintf(stderr,
 				     "[SpoutSenderEngine] attach refused: no free sender name for '%s'\n",
 				     requested.c_str());
 			return -1;
 		}
-		if (resolved != requested) {
+		if (!wasSticky && resolved != requested) {
 			std::fprintf(stderr,
 				     "[SpoutSenderEngine] name collision: requested '%s' -> resolved '%s'\n",
 				     requested.c_str(), resolved.c_str());
@@ -245,7 +249,12 @@ int SpoutSenderEngine::attach(obs_source_t *source, const std::string &machine, 
 
 	obs_source_t *ref = obs_source_get_ref(source);
 	if (!ref) {
-		if (!resolved.empty())
+		// Roll back a FRESH reservation only; a sticky reuse keeps its reservation (the record
+		// still owns the name -- release happens at record removal/shutdown, never here). The
+		// explicit flag, NOT string equality, discriminates: a STALE sticky (e.g. released by a
+		// wholesale stop()) that freshly re-resolved to the same string is a fresh reservation
+		// and must be rolled back too.
+		if (!resolved.empty() && !wasSticky)
 			allocator_.release(resolved);
 		return -1; // source already destroyed
 	}
@@ -294,16 +303,36 @@ void SpoutSenderEngine::detach(int slotId)
 	if (!owned->audioOnly && obs_initialized())
 		obs_queue_task(OBS_TASK_GRAPHICS, &SpoutSenderEngine::teardownSlotGpuTask, owned.get(), true);
 
-	// 3. Release the source refs + the name reservation. We are the sole owner; no other thread
-	//    can touch this record.
+	// 3. Release the source refs. We are the sole owner; no other thread can touch this record.
+	//    The name reservation is intentionally NOT released (sticky-name contract): the caller's
+	//    record keeps the name across broadcast cycles so a re-attach publishes the SAME name --
+	//    a name-keyed consumer bound to it must never see the name re-issued to a different
+	//    source. The reservation drops only via releaseSenderName() (record removal/teardown) or
+	//    stop() (shutdown).
 	if (owned->source) {
 		obs_source_dec_active(owned->source); // pairs the attach-time inc_active
 		obs_source_release(owned->source);
 		owned->source = nullptr;
 	}
-	if (!owned->resolvedName.empty())
-		allocator_.release(owned->resolvedName);
 	// `owned` destructs here -- after the graphics thread is provably done with the slot.
+}
+
+void SpoutSenderEngine::releaseSenderName(const std::string &resolvedName)
+{
+	// The single per-source reservation release (sticky-name contract): called when the owning
+	// source record is removed or the instance tears down -- never on broadcast detach.
+	if (!resolvedName.empty())
+		allocator_.release(resolvedName);
+}
+
+std::string SpoutSenderEngine::slotResolvedName(int slotId)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	for (const auto &s : slots_) {
+		if (s->id == slotId && !s->dead)
+			return s->resolvedName;
+	}
+	return std::string();
 }
 
 size_t SpoutSenderEngine::activeCount()
@@ -693,7 +722,7 @@ void SpoutSenderEngine::renderSlot(Slot *slot, bool batched, bool collectStats, 
 		actual = n ? n : "";
 	}
 
-	bool diverged = false;
+	std::string divergedFrom;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		slot->lastSendOk = ok;
@@ -704,15 +733,24 @@ void SpoutSenderEngine::renderSlot(Slot *slot, bool batched, bool collectStats, 
 			if (!slot->actualName.empty() && slot->actualName != slot->resolvedName &&
 			    !slot->divergenceLogged) {
 				slot->divergenceLogged = true;
-				diverged = true;
+				divergedFrom = slot->resolvedName;
+				// STICKY-NAME SYNC (adoption): the PUBLISHED name is what receivers latch
+				// onto, so the bookkeeping must follow the adoption -- move the allocator
+				// reservation to the adopted name and make it the slot's canonical resolved
+				// name. slotInfos() then carries it, the owning record mirrors it into its
+				// sticky name (refresh path), and every later re-attach re-announces the
+				// name that was actually published -- never the lost pre-registration one.
+				// rebind() is pure set ops (no registry probe, no D3D): graphics-thread safe.
+				allocator_.rebind(slot->resolvedName, slot->actualName);
+				slot->resolvedName = slot->actualName;
 			}
 		}
 	}
-	if (diverged) {
+	if (!divergedFrom.empty()) {
 		std::fprintf(stderr,
 			     "[SpoutSenderEngine] WARNING: Spout registered '%s' (requested '%s') -- "
 			     "adopting the actual name\n",
-			     slot->actualName.c_str(), slot->resolvedName.c_str());
+			     slot->actualName.c_str(), divergedFrom.c_str());
 	}
 	if (!ok) {
 		std::fprintf(stderr, "[SpoutSenderEngine] SendTexture failed (slot %d, '%s')\n", slot->id,

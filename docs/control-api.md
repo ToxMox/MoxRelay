@@ -329,6 +329,7 @@ Events are **opt-in per connection** via `Subscribe`, with one exception
 | `audioChanged` | A source's audio (gain/muted/balance/sync) changed. |
 | `mediaChanged` | A media source's transport state changed. |
 | `sourceIdleModeChanged` | A source's idle mode changed. |
+| `devicesChanged` | The set of present video-capture devices changed (plug/unplug). `data.added` / `data.removed` list `{id, name}`. A device arrival also auto-recovers any source waiting on that device. Additive; older helpers never emit it. |
 
 The exact subscribable set is also reported live by
 `GetVersion` -> `capabilities.events`.

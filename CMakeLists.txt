@@ -220,6 +220,8 @@ add_executable(moxrelay
 	src/app/HelperConfig.hpp
 	src/app/ParentWatch.cpp
 	src/app/ParentWatch.hpp
+	src/app/DeviceArrivalWatch.cpp
+	src/app/DeviceArrivalWatch.hpp
 	src/app/RendezvousPipe.cpp
 	src/app/RendezvousPipe.hpp
 	src/audio/AudioDeviceNotify.cpp
@@ -307,7 +309,8 @@ target_link_libraries(moxrelay PRIVATE
 	dxgi
 	ole32
 	avrt
-	bcrypt)
+	bcrypt
+	cfgmgr32)
 
 # Build as the WINDOWS subsystem so no console window appears for ANY launcher (standalone or the
 # managed child launch). Keep the existing int main(argc,argv): /ENTRY:mainCRTStartup runs the CRT

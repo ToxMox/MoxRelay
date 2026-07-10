@@ -24,7 +24,7 @@
 namespace moxrelay {
 
 // The helper build/protocol version published in every instance entry.
-inline constexpr const char *kMoxRelayVersion = "0.19.0-m13";
+inline constexpr const char *kMoxRelayVersion = "0.21.0-m15";
 
 // This instance's discovery identity.
 //

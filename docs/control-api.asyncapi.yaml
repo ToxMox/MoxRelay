@@ -6,7 +6,7 @@ x-apiVersion: 1 # control-protocol version (matches GetVersion.result.apiVersion
 
 info:
   title: MoxRelay Control API
-  version: 1.11.0
+  version: 1.13.0
   license:
     name: GPL-3.0
     url: https://www.gnu.org/licenses/gpl-3.0.html
@@ -305,6 +305,7 @@ channels:
       AudioChangedEvent: { $ref: '#/components/messages/AudioChangedEvent' }
       AudioLevelsEvent: { $ref: '#/components/messages/AudioLevelsEvent' }
       SourceIdleModeChangedEvent: { $ref: '#/components/messages/SourceIdleModeChangedEvent' }
+      DevicesChangedEvent: { $ref: '#/components/messages/DevicesChangedEvent' }
       InstanceShuttingDownEvent: { $ref: '#/components/messages/InstanceShuttingDownEvent' }
       ShutdownRequest: { $ref: '#/components/messages/ShutdownRequest' }
       ShutdownReply: { $ref: '#/components/messages/ShutdownReply' }
@@ -732,6 +733,7 @@ operations:
       - $ref: '#/channels/control/messages/AudioChangedEvent'
       - $ref: '#/channels/control/messages/AudioLevelsEvent'
       - $ref: '#/channels/control/messages/SourceIdleModeChangedEvent'
+      - $ref: '#/channels/control/messages/DevicesChangedEvent'
       - $ref: '#/channels/control/messages/InstanceShuttingDownEvent'
 
 components:
@@ -781,7 +783,7 @@ components:
               capabilities:
                 sourceTypes: [camera, display, window, game, media, image, color, text, audio_input, audio_output]
                 filterTypes: [color_correction, chroma_key, color_key, luma_key, crop, mask, lut, scale, scroll, sharpness, render_delay, video_delay, hdr_tonemap, gain, compressor, upward_compressor, expander, limiter, noise_gate, noise_suppress, eq_3band, invert_polarity]
-                events: [status, sourceAdded, sourceRemoved, filterAdded, filterRemoved, filterChanged, propertyChanged, mediaChanged, audioChanged, audioLevels, sourceIdleModeChanged, senderNameResolved, broadcastChanged]
+                events: [status, sourceAdded, sourceRemoved, filterAdded, filterRemoved, filterChanged, propertyChanged, mediaChanged, audioChanged, audioLevels, sourceIdleModeChanged, senderNameResolved, broadcastChanged, devicesChanged]
                 audioOutput: true
         - name: error-unknown-method
           payload:
@@ -1780,8 +1782,9 @@ components:
         SourceFormat schema). The format is fixed per sender attach: a change
         on a broadcasting source recreates its sender (detach + re-attach), so
         the source briefly reports senderName null and a fresh
-        senderNameResolved fires (the name normally resolves back to the same
-        string). On a non-broadcasting source the new format applies at the
+        senderNameResolved fires (the name resolves back to the SAME string --
+        the sticky-name guarantee, see senderNameResolved). On a
+        non-broadcasting source the new format applies at the
         next attach. Setting the current format is an idempotent no-op.
         Runtime format changes are ephemeral (persistence semantics).
       correlationId: { location: '$message.payload#/id' }
@@ -2225,7 +2228,16 @@ components:
         its first transmitted frame), or changed (rare collision-resolution
         case). This is the moment to bind a receiver -- the name is identical
         to the one published in the discovery file. Also fires for sources
-        re-attached by StartBroadcast.
+        re-attached by StartBroadcast. STABILITY GUARANTEE (since 1.13.0):
+        sender names are sticky -- a source keeps its PUBLISHED name across
+        broadcast stop/start cycles (the name stays reserved while the source
+        exists, including while it is not broadcasting) and the name is
+        released only when the source is removed or the instance shuts down.
+        If the registry auto-suffixes at first publish (rare external
+        collision), the adopted published name becomes the sticky name. A
+        re-attach therefore re-announces the same published name, and a
+        published name is never re-issued to a different source while its
+        original owner still exists.
       payload: { $ref: '#/components/schemas/SenderNameResolvedEventEnvelope' }
       examples:
         - name: push-collision-suffixed
@@ -2380,6 +2392,29 @@ components:
           payload:
             event: sourceIdleModeChanged
             data: { instanceId: tier-60, ts: 1765300000123, sourceId: src_4, releaseWhenIdle: true }
+    DevicesChangedEvent:
+      name: devicesChanged
+      title: devicesChanged event
+      summary: >-
+        The set of present video-capture devices changed -- a device was
+        plugged in or removed. added/removed each list the affected devices as
+        {id, name} (id is the stable device selector; name is the human-readable
+        label). Emitted only on an actual change (never for the instance's first
+        device enumeration, which just establishes the baseline). A device
+        arrival additionally triggers automatic recovery of any source that was
+        waiting on that device (see the propertyChanged echo). Additive; older
+        helpers never emit it, so a client that subscribes and receives nothing
+        is simply talking to an older instance.
+      payload: { $ref: '#/components/schemas/DevicesChangedEventEnvelope' }
+      examples:
+        - name: push
+          payload:
+            event: devicesChanged
+            data:
+              instanceId: tier-60
+              ts: 1765300000123
+              added: [{ id: '\\?\usb#vid_046d...', name: 'Webcam Pro' }]
+              removed: []
     InstanceShuttingDownEvent:
       name: instanceShuttingDown
       title: instanceShuttingDown event
@@ -3437,7 +3472,8 @@ components:
             Event names. Subscribable names: status, sourceAdded,
             sourceRemoved, filterAdded, filterRemoved, filterChanged,
             propertyChanged, mediaChanged, audioChanged, audioLevels,
-            sourceIdleModeChanged, senderNameResolved, broadcastChanged.
+            sourceIdleModeChanged, senderNameResolved, broadcastChanged,
+            devicesChanged.
             instanceShuttingDown is not subscribable -- it is always delivered.
           items: { type: string }
     SubscribeResult:
@@ -3552,6 +3588,31 @@ components:
             ts: { type: integer }
             sourceId: { type: string }
             releaseWhenIdle: { type: boolean }
+    DeviceRef:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, description: Stable device selector (the value stored as a source's device setting). }
+        name: { type: string, description: Human-readable device label. }
+    DevicesChangedEventEnvelope:
+      type: object
+      required: [event, data]
+      properties:
+        event: { type: string, const: devicesChanged }
+        data:
+          type: object
+          required: [instanceId, ts, added, removed]
+          properties:
+            instanceId: { type: string }
+            ts: { type: integer }
+            added:
+              type: array
+              items: { $ref: '#/components/schemas/DeviceRef' }
+              description: Devices newly present since the last enumeration.
+            removed:
+              type: array
+              items: { $ref: '#/components/schemas/DeviceRef' }
+              description: Devices no longer present since the last enumeration.
     FilterAddedEventEnvelope:
       type: object
       required: [event, data]

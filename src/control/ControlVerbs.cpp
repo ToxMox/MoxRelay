@@ -7,6 +7,7 @@
 #include "ControlVerbs.hpp"
 
 #include "app/ProfileStore.hpp"
+#include "app/SpoutNaming.hpp"
 #include "audio/AudioMixEngine.hpp"
 #include "control/AudioDevices.hpp"
 #include "control/TypeVocabulary.hpp"
@@ -298,8 +299,21 @@ void ControlVerbs::adoptBootSources(std::vector<CreatedSource> sources, bool att
 				     "reported as 'media'\n",
 				     cs.name.c_str());
 		}
-		if (attachedInOrder && i < infos.size())
+		if (attachedInOrder && i < infos.size()) {
 			rec.slotId = infos[i].slotId;
+			// Adopt the slot's name reservation as this record's sticky name (kept across
+			// broadcast cycles; released only at RemoveSource / teardown) -- but ONLY when the
+			// zip correspondence is PROVEN. The zip is by index (attach order == vector order),
+			// which can misalign when a mid-list attach failed -- a pre-existing risk of this
+			// boot path that predates sticky names. requestedName derives deterministically
+			// from the source name, so it anchors the check; on a mismatch the reservation is
+			// NOT adopted (the record simply resolves fresh at its next attach) rather than
+			// risking adopting -- and later releasing -- a SIBLING's live name.
+			const std::string expect =
+				SpoutNaming::makeSenderName(identity_.machine, identity_.port, cs.name);
+			if (infos[i].requestedName == expect)
+				rec.allocatedSenderName = infos[i].resolvedName;
+		}
 		recs_.push_back(std::move(rec));
 		connectMediaSignals(recs_.back());
 		// Warm the property cache for cascade-audited types (camera) -- same freeze-fix reason as
@@ -337,7 +351,7 @@ std::vector<std::string> ControlVerbs::subscribableEvents() const
 		"filterAdded",       "filterRemoved",     "filterChanged",
 		"senderNameResolved", "broadcastChanged",  "propertyChanged",
 		"mediaChanged",      "audioChanged",      "audioLevels",
-		"sourceIdleModeChanged"};
+		"sourceIdleModeChanged", "devicesChanged"};
 }
 
 void ControlVerbs::emitEvent(const std::string &name, nlohmann::json data)
@@ -386,6 +400,11 @@ void ControlVerbs::refreshFromEngine()
 		rec.sends = info.sends;
 		rec.lastSendOk = info.lastSendOk;
 		rec.initFailed = info.initFailed;
+		// Sticky-name sync: a registration-time adoption (rare lost cross-process race) moves the
+		// slot's canonical resolved name to the PUBLISHED one; mirror it into the record's sticky
+		// name so every later re-attach AND the final release use the name receivers latched onto.
+		if (!info.resolvedName.empty() && rec.allocatedSenderName != info.resolvedName)
+			rec.allocatedSenderName = info.resolvedName;
 		if (!info.actualName.empty() &&
 		    (!rec.senderAnnounced || rec.senderName != info.actualName)) {
 			rec.senderName = info.actualName;
@@ -584,6 +603,12 @@ void ControlVerbs::releaseAllSources()
 		if (rec.slotId >= 0 && engine_) {
 			engine_->detach(rec.slotId);
 			rec.slotId = -1;
+		}
+		// Sticky-name release at instance teardown (idempotent with engine_->stop()'s own
+		// shutdown release; also covers DARK records whose reservation outlived their slot).
+		if (engine_ && !rec.allocatedSenderName.empty()) {
+			engine_->releaseSenderName(rec.allocatedSenderName);
+			rec.allocatedSenderName.clear();
 		}
 		disconnectMediaSignals(rec);
 		for (auto &f : rec.filters) {
@@ -921,8 +946,12 @@ nlohmann::json ControlVerbs::handleCreateSource(const nlohmann::json &id, const 
 		SenderFormat fmt = SenderFormat::Srgb87;
 		SpoutSenderEngine::parseFormat(rec.format, fmt); // validated above
 		rec.slotId = engine_->attach(rec.source, identity_.machine, identity_.port, rec.displayName, fmt);
-		if (rec.slotId >= 0 && audio_)
-			audio_->attachSource(rec.source, rec.sourceId); // the attach edge IS the audio edge
+		if (rec.slotId >= 0) {
+			// Capture the sticky name this record now owns (kept across detach/attach).
+			rec.allocatedSenderName = engine_->slotResolvedName(rec.slotId);
+			if (audio_)
+				audio_->attachSource(rec.source, rec.sourceId); // the attach edge IS the audio edge
+		}
 	}
 
 	recs_.push_back(std::move(rec));
@@ -959,6 +988,12 @@ nlohmann::json ControlVerbs::handleRemoveSource(const nlohmann::json &id, const 
 	if (rec->slotId >= 0 && engine_) {
 		engine_->detach(rec->slotId);
 		rec->slotId = -1;
+	}
+	// Sticky-name release: RemoveSource is the per-source end of life, the ONLY place a record's
+	// name reservation returns to the pool (broadcast detach keeps it -- name stability).
+	if (engine_ && !rec->allocatedSenderName.empty()) {
+		engine_->releaseSenderName(rec->allocatedSenderName);
+		rec->allocatedSenderName.clear();
 	}
 	disconnectMediaSignals(*rec);
 	for (auto &f : rec->filters) {
@@ -1138,26 +1173,40 @@ nlohmann::json ControlVerbs::handleSetSourceProperties(const nlohmann::json &id,
 			   {{"category", "source"}, {"sourceId", sourceId}});
 	}
 
+	// Post-update sequence -- inert-until-configured activation, the enumeration-#2 descriptor echo
+	// (cache replay / cascade refresh / live), and the propertyChanged emission -- is shared verbatim
+	// with the device-arrival self-heal path; see emitPropertyChangedEcho. The reply carries the SAME
+	// echo the event does (contract: delivered to every subscribed connection, incl. the originator).
+	json echo = emitPropertyChangedEcho(*rec, settings, plainToggle);
+	return ok(id, std::move(echo));
+}
+
+// The post-update sequence extracted from handleSetSourceProperties so the device-arrival self-heal
+// path reuses the EXACT wire echo (do not diverge the two). Observable behavior is unchanged from the
+// former inline block.
+nlohmann::json ControlVerbs::emitPropertyChangedEcho(SourceRec &rec, const json &settings, bool plainToggle)
+{
 	// Inert-until-configured: a source created without its target (standalone "Add Source") holds NO
-	// showing ref. Once the user commits a valid target, raise the ref so it activates/captures --
-	// the same state a configured-at-creation source has. Gated on the target NOW being set, so an
-	// unrelated property edit never spuriously activates a still-unconfigured source. Only the gated
-	// types (camera/display/window) can be inert, so non-target types never reach the raise.
-	if (!rec->deviceShowing) {
+	// showing ref. Once a valid target is committed, raise the ref so it activates/captures -- the same
+	// state a configured-at-creation source has. Gated on the target NOW being set, so an unrelated
+	// property edit never spuriously activates a still-unconfigured source. Only the gated types
+	// (camera/display/window) can be inert, so non-target types never reach the raise. (For the self-
+	// heal path the source is already showing, so this no-ops.)
+	if (!rec.deviceShowing) {
 		const SourceTypeEntry *typeEntry = nullptr;
-		if (auto eng = TypeVocabulary::sourceEngineId(rec->wireType))
+		if (auto eng = TypeVocabulary::sourceEngineId(rec.wireType))
 			typeEntry = TypeVocabulary::sourceTypeByEngineId(*eng);
-		if (obs_data_t *cur = obs_source_get_settings(rec->source)) {
+		if (obs_data_t *cur = obs_source_get_settings(rec.source)) {
 			if (TypeVocabulary::targetConfigured(typeEntry, cur)) {
-				const bool idle = (rec->slotId < 0);
-				applyDeviceShowing(*rec, deviceShouldShow(*rec, idle));
+				const bool idle = (rec.slotId < 0);
+				applyDeviceShowing(rec, deviceShouldShow(rec, idle));
 			}
 			obs_data_release(cur);
 		}
 	}
 
 	// Echo the submitted keys with their STORED values after the update.
-	const json stored = engineSettingsToWire(rec->source, rec->wireType);
+	const json stored = engineSettingsToWire(rec.source, rec.wireType);
 	json applied = json::object();
 	for (auto it = settings.begin(); it != settings.end(); ++it)
 		applied[it.key()] = stored.contains(it.key()) ? stored[it.key()] : it.value();
@@ -1171,31 +1220,264 @@ nlohmann::json ControlVerbs::handleSetSourceProperties(const nlohmann::json &id,
 	// the host reconciler treat a populated array as "the current descriptor set"; an empty array
 	// would be read as "rebuild from empty", never "no cascade". So a plain toggle replays the cache,
 	// it never emits an empty array.
+	const bool audited = sourceCascadeKeysAudited(rec.wireType);
 	json properties;
 	if (plainToggle) {
-		properties = rec->cachedDescriptors; // cache replay -- no enumeration
+		properties = rec.cachedDescriptors; // cache replay -- no enumeration
 	} else if (audited) {
-		refreshSourcePropsCache(*rec); // cascade: single enumeration refreshes descriptors + keys
-		properties = rec->cachedDescriptors;
+		refreshSourcePropsCache(rec); // cascade: single enumeration refreshes descriptors + keys
+		properties = rec.cachedDescriptors;
 	} else {
 		properties = json::array(); // non-audited: live enumeration (cheap; not cached)
-		if (obs_properties_t *props = obs_source_properties(rec->source)) {
-			properties = TypeVocabulary::describeProperties(props, rec->wireType);
+		if (obs_properties_t *props = obs_source_properties(rec.source)) {
+			properties = TypeVocabulary::describeProperties(props, rec.wireType);
 			obs_properties_destroy(props);
 		}
 	}
 
-	// Every successful apply -- wire or GUI, both ride this handler -- announces itself with
-	// the SAME echo the reply carries (contract: delivered to all subscribed connections,
-	// including the originator). `applied` stays submitted-keys-only; `settings`/`properties`
-	// add the full post-apply state (additive; old clients ignore them).
-	json echo = {{"sourceId", sourceId},
+	// `applied` stays submitted-keys-only; `settings`/`properties` add the full post-apply state
+	// (additive; old clients ignore them).
+	json echo = {{"sourceId", rec.sourceId},
 		     {"applied", std::move(applied)},
 		     {"settings", stored},
 		     {"properties", std::move(properties)}};
 	emitEvent("propertyChanged", echo);
+	return echo;
+}
 
-	return ok(id, std::move(echo));
+void ControlVerbs::setDeviceSnapshotProvider(std::function<DeviceSnapshot()> provider)
+{
+	deviceSnapshotProvider_ = std::move(provider);
+}
+
+ControlVerbs::DeviceSnapshot ControlVerbs::enumerateVideoCaptureDevices()
+{
+	// TRANSIENT, type-only camera properties -- no live source is created or touched (mirrors
+	// EnumerateSourceVariants' device-list walk, minus the resolution/fps cascade). Walk the
+	// video_device_id list into {deviceId -> friendly name}; skip disabled placeholder rows.
+	DeviceSnapshot out;
+	if (obs_properties_t *props = obs_get_source_properties("dshow_input")) {
+		if (obs_property_t *devList = obs_properties_get(props, "video_device_id")) {
+			const size_t n = obs_property_list_item_count(devList);
+			for (size_t i = 0; i < n; ++i) {
+				if (obs_property_list_item_disabled(devList, i))
+					continue; // "no devices" / placeholder rows
+				const char *devId = obs_property_list_item_string(devList, i);
+				const char *devName = obs_property_list_item_name(devList, i);
+				if (!devId || !*devId)
+					continue;
+				out[devId] = devName ? devName : "";
+			}
+		}
+		obs_properties_destroy(props);
+	}
+	return out;
+}
+
+void ControlVerbs::refreshDeviceSnapshotAndHeal()
+{
+	// (1) Snapshot the present video-capture device set. The injected provider lets the self-test drive
+	// this with NO hardware; unset in production, snapshots come from the real type-only enumeration.
+	DeviceSnapshot current =
+		deviceSnapshotProvider_ ? deviceSnapshotProvider_() : enumerateVideoCaptureDevices();
+
+	// EMPTY-ENUMERATION guard (load-bearing; mirrors refreshSourcePropsCache): NEVER commit an empty
+	// enumeration. A transient empty device list (the classic mid-replug driver-reset moment) would
+	// diff as a FALSE removed=[everything], then clobber the stored snapshot so the NEXT pass diffs as
+	// a FALSE added=[everything] -- one normal replug becoming a spurious remove-all + add-all event
+	// storm. So an empty result neither diffs, nor emits, nor replaces a previously-good snapshot; and
+	// with NO baseline yet it does NOT become one (a boot-time transient must not lock in an empty
+	// baseline -- a later refresh establishes it). The self-heal pass over an empty snapshot is a no-op
+	// anyway (no saved device can be "present"), so returning here skips nothing real.
+	if (current.empty())
+		return;
+
+	// (2) Diff vs the previous snapshot. The FIRST snapshot is the baseline: we cannot honestly claim
+	// anything was "added", so no devicesChanged is emitted -- it only establishes the reference set.
+	// Otherwise emit an ADDITIVE devicesChanged when the diff is non-empty. `removed` names come from
+	// the PREVIOUS snapshot (the departed device's last-known name); `added` from the current one.
+	// Saved-device ids that transitioned absent->present on THIS pass. Captured here, BEFORE the
+	// `added` array is std::move'd into emitEvent and BEFORE deviceSnapshot_ is overwritten below, so
+	// the self-heal pass can consult it. Stays empty on the baseline pass (no prior snapshot to diff).
+	std::set<std::string> arrived;
+	if (haveDeviceSnapshot_) {
+		json added = json::array();
+		json removed = json::array();
+		for (const auto &[devId, name] : current)
+			if (!deviceSnapshot_.count(devId)) {
+				added.push_back({{"id", devId}, {"name", name}});
+				arrived.insert(devId);
+			}
+		for (const auto &[devId, name] : deviceSnapshot_)
+			if (!current.count(devId))
+				removed.push_back({{"id", devId}, {"name", name}});
+		if (!added.empty() || !removed.empty()) {
+			// One diagnostic line per emission (materializes only when a log sink is active).
+			std::string addedIds, removedIds;
+			for (const auto &a : added)
+				addedIds += (addedIds.empty() ? "" : ",") + a.value("id", std::string());
+			for (const auto &r : removed)
+				removedIds += (removedIds.empty() ? "" : ",") + r.value("id", std::string());
+			std::fprintf(stdout, "[control] devices changed: added=[%s] removed=[%s]\n",
+				     addedIds.c_str(), removedIds.c_str());
+			emitEvent("devicesChanged",
+				  {{"added", std::move(added)}, {"removed", std::move(removed)}});
+		}
+	}
+	deviceSnapshot_ = current;
+	haveDeviceSnapshot_ = true;
+
+	// (3) DISCIPLINED self-heal pass (runs after EVERY snapshot, baseline included). For each camera
+	// source whose saved video_device_id is present in the current snapshot and that should be live,
+	// force a capture restart by re-applying the stored device id -- but only under the heal-discipline
+	// predicate below, so a device-busy source (win-dshow leaves it frameless forever) or a re-cascade
+	// echo can no longer drive an unbounded restart storm:
+	//   * ARRIVAL heal (saved device just transitioned absent->present this pass, in `arrived`): RESETS
+	//     the fruitless streak and bypasses the cap -- a genuine new arrival is a fresh chance. This branch
+	//     is load-bearing for hot-replug: a hot-unplugged win-dshow source keeps STALE nonzero last-frame
+	//     dimensions (async_active only clears on an explicit NULL frame it never receives), so the
+	//     width==0 proxy alone would veto its heal, yet a device that just came back cannot have been
+	//     capturing across the gap. RATE LIMIT: an arrival heal fires iff (no prior heal attempt) OR
+	//     (nonzero dimensions were observed since the last attempt) OR (>= kHealCooldownMs since the last
+	//     attempt). A legit replug therefore heals instantly (the source produced frames before the unplug,
+	//     or the last attempt is long past), while a marginal device flapping every ~1-2 s degrades to one
+	//     restart per cooldown window instead of one per flap.
+	//   * STATELESS FRAMELESS heal (producing NO frames -- width/height == 0 -- and NOT a fresh arrival):
+	//     allowed only if BOTH a MONOTONIC cooldown (>= kHealCooldownMs since this source's last attempt)
+	//     AND a consecutive-fruitless cap (< kHealMaxFruitless) permit it. An attempt is presumed
+	//     fruitless (streak++) until frames are observed; observing nonzero dimensions resets the streak.
+	//   * PRODUCTIVE-OWNER guard (stateless branch ONLY): never frameless-restart a source whose saved
+	//     device is currently owned productively (nonzero dimensions) by ANOTHER record -- restarting
+	//     would steal the device. ARRIVAL heals SKIP this guard entirely: a device that just transitioned
+	//     absent->present cannot have been captured across the gap, so any sibling's nonzero dims for that
+	//     device are definitionally stale (the hot-unplug freeze above) -- honoring them would trust a lie,
+	//     starve the arriving source, and on a two-stale-owner replug mutually suppress BOTH heals so
+	//     nobody reopens the device. Accepted residual on the stateless branch: a device grabbed by an
+	//     EXTERNAL process while a frozen (stale-nonzero) sibling record exists stays suppressed until a
+	//     real device event (arrival) clears it.
+	// Re-applying the id bypasses handleSetSourceProperties on purpose (its no-op guard skips identical
+	// resubmits, which is exactly this case); the SAME post-update sequence the wire path runs then emits
+	// the standard propertyChanged echo (video_device_id is a cascade key -> the audited branch refreshes
+	// descriptors). Live sources that did NOT just re-arrive and sources whose device is absent or which
+	// should be dark are NEVER touched. Timing is std::chrono::steady_clock -- monotonic, never wall clock.
+	constexpr long long kHealCooldownMs = 10000; // >= 10 s between stateless frameless heals per source
+	constexpr int kHealMaxFruitless = 3;         // stop after this many consecutive fruitless attempts
+	const auto healNow = std::chrono::steady_clock::now();
+	for (auto &rec : recs_) {
+		if (rec.wireType != "camera" || !rec.source)
+			continue;
+		// The saved device selector is a raw engine key (win-dshow's target); read it directly.
+		std::string devId;
+		if (obs_data_t *s = obs_source_get_settings(rec.source)) {
+			const char *v = obs_data_get_string(s, "video_device_id");
+			devId = v ? v : "";
+			obs_data_release(s);
+		}
+		if (devId.empty() || !current.count(devId))
+			continue; // no saved target, or the saved device is not currently present
+		const bool idle = (rec.slotId < 0);
+		if (!deviceShouldShow(rec, idle))
+			continue; // disabled, or release-when-idle while idle: intentionally dark
+
+		const bool frameless =
+			(obs_source_get_width(rec.source) == 0 || obs_source_get_height(rec.source) == 0);
+		const bool isArrival = arrived.count(devId) > 0;
+
+		// Observing productive frames is a fresh chance: clear the fruitless streak and note the
+		// productive spell (the arrival rate limit trusts it). A live source that did NOT just
+		// re-arrive is never restarted.
+		if (!frameless) {
+			rec.healFruitlessCount = 0;
+			rec.healSeenFramesSinceAttempt = true;
+			if (!isArrival)
+				continue;
+		}
+
+		// Monotonic elapsed-since-last-attempt (meaningful only when healEverAttempted).
+		const long long elapsedMs =
+			rec.healEverAttempted
+				? std::chrono::duration_cast<std::chrono::milliseconds>(healNow -
+											rec.healLastAttempt)
+					  .count()
+				: 0;
+
+		// Heal-eligibility predicate + reason.
+		const char *reason = nullptr;
+		if (isArrival) {
+			rec.healFruitlessCount = 0; // arrival is a fresh chance -- reset the streak
+			// Arrival rate limit: instant when never attempted or productive since the last attempt;
+			// a FRUITLESS arrival (flapping device, no frames since the last restart) honors the
+			// cooldown so the per-flap restart cadence cannot return.
+			if (rec.healEverAttempted && !rec.healSeenFramesSinceAttempt &&
+			    elapsedMs < kHealCooldownMs) {
+				std::fprintf(stdout,
+					     "[control] heal suppressed: source=%s reason=cooldown\n",
+					     rec.sourceId.c_str());
+				continue;
+			}
+			reason = "arrival";
+		} else {
+			// Stateless frameless heal: gated by the fruitless cap, then the monotonic cooldown.
+			if (rec.healFruitlessCount >= kHealMaxFruitless) {
+				std::fprintf(stdout, "[control] heal suppressed: source=%s reason=cap\n",
+					     rec.sourceId.c_str());
+				continue;
+			}
+			if (rec.healEverAttempted && elapsedMs < kHealCooldownMs) {
+				std::fprintf(stdout,
+					     "[control] heal suppressed: source=%s reason=cooldown\n",
+					     rec.sourceId.c_str());
+				continue;
+			}
+			reason = "frameless";
+
+			// Per-device productive-owner guard (stateless branch ONLY -- an arrival makes any
+			// sibling's nonzero dims for this device definitionally stale, see the block comment):
+			// another record on the SAME saved device reporting nonzero dimensions productively owns
+			// it -- healing here would restart and steal it. Skip.
+			bool siblingOwns = false;
+			for (const auto &other : recs_) {
+				if (&other == &rec || other.wireType != "camera" || !other.source)
+					continue;
+				std::string otherDev;
+				if (obs_data_t *os = obs_source_get_settings(other.source)) {
+					const char *ov = obs_data_get_string(os, "video_device_id");
+					otherDev = ov ? ov : "";
+					obs_data_release(os);
+				}
+				if (otherDev != devId)
+					continue;
+				if (obs_source_get_width(other.source) != 0 &&
+				    obs_source_get_height(other.source) != 0) {
+					siblingOwns = true;
+					break;
+				}
+			}
+			if (siblingOwns) {
+				std::fprintf(stdout,
+					     "[control] heal suppressed: source=%s reason=sibling-owns\n",
+					     rec.sourceId.c_str());
+				continue;
+			}
+		}
+
+		// Commit the attempt (monotonic stamp). A stateless frameless attempt is presumed fruitless
+		// until frames appear (the !frameless branch above clears the streak); arrival heals do not
+		// count toward the cap but still stamp the time so a following frameless heal honors the cooldown.
+		rec.healLastAttempt = healNow;
+		rec.healEverAttempted = true;
+		rec.healSeenFramesSinceAttempt = false;
+		if (!isArrival)
+			++rec.healFruitlessCount;
+		std::fprintf(stdout, "[control] heal: source=%s reason=%s\n", rec.sourceId.c_str(), reason);
+
+		if (obs_data_t *patch = obs_data_create()) {
+			obs_data_set_string(patch, "video_device_id", devId.c_str());
+			obs_source_update(rec.source, patch);
+			obs_data_release(patch);
+		}
+		emitPropertyChangedEcho(rec, json{{"video_device_id", devId}}, /*plainToggle=*/false);
+	}
 }
 
 nlohmann::json ControlVerbs::handleListSourceProperties(const nlohmann::json &id, const nlohmann::json &params)
@@ -1911,8 +2193,10 @@ nlohmann::json ControlVerbs::handleSetSourceFormat(const nlohmann::json &id, con
 		rec->sends = 0;
 		rec->lastSendOk = false;
 
+		// Sticky re-attach: the record kept its name reservation across the detach above, so the
+		// recreated sender publishes the SAME name (senderNameResolved re-announces it).
 		const int slot = engine_->attach(rec->source, identity_.machine, identity_.port,
-						 rec->displayName, parsed);
+						 rec->displayName, parsed, rec->allocatedSenderName);
 		if (slot < 0) {
 			// The transition failed mid-flight: the source is now genuinely detached, which
 			// IS a broadcast stop -- surface it (the event is the truth), then report 1011.
@@ -1924,6 +2208,7 @@ nlohmann::json ControlVerbs::handleSetSourceFormat(const nlohmann::json &id, con
 				    {"detail", "the source is no longer broadcasting; StartBroadcast to retry"}});
 		}
 		rec->slotId = slot;
+		rec->allocatedSenderName = engine_->slotResolvedName(slot); // normally unchanged (sticky)
 		if (audio_)
 			audio_->attachSource(rec->source, rec->sourceId);
 	}
@@ -1963,11 +2248,14 @@ nlohmann::json ControlVerbs::handleStartBroadcast(const nlohmann::json &id, cons
 			applyDeviceShowing(*rec, /*shouldShow=*/!rec->disabled); // reacquire (if released) before attach, unless disabled
 			SenderFormat fmt = SenderFormat::Srgb87;
 			SpoutSenderEngine::parseFormat(rec->format, fmt); // rec.format is always validated
+			// Sticky re-attach: a record that broadcast before kept its name reservation across
+			// the stop, so it re-publishes under the SAME name (name stability for receivers).
 			const int slot = engine_->attach(rec->source, identity_.machine, identity_.port,
-							 rec->displayName, fmt);
+							 rec->displayName, fmt, rec->allocatedSenderName);
 			if (slot < 0)
 				continue; // could not attach; absent from `started`
 			rec->slotId = slot;
+			rec->allocatedSenderName = engine_->slotResolvedName(slot); // first attach captures it
 			if (audio_)
 				audio_->attachSource(rec->source, rec->sourceId);
 			rec->senderName.clear();
@@ -2438,6 +2726,12 @@ void ControlVerbs::releaseAllSourcesForReload()
 		if (rec.slotId >= 0 && engine_) {
 			engine_->detach(rec.slotId);
 			rec.slotId = -1;
+		}
+		// Sticky-name release at instance teardown (idempotent with engine_->stop()'s own
+		// shutdown release; also covers DARK records whose reservation outlived their slot).
+		if (engine_ && !rec.allocatedSenderName.empty()) {
+			engine_->releaseSenderName(rec.allocatedSenderName);
+			rec.allocatedSenderName.clear();
 		}
 		disconnectMediaSignals(rec);
 		for (auto &f : rec.filters) {

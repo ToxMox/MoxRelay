@@ -17,6 +17,7 @@
 
 #include "app/AppSettings.hpp"
 #include "app/CliOptions.hpp"
+#include "app/DeviceArrivalWatch.hpp"
 #include "app/HelperConfig.hpp"
 #include "app/LogSink.hpp"
 #include "app/ObsBootstrap.hpp"
@@ -77,6 +78,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 
 // Win32/DXGI -- isolated to this TU for the GPU-adapter count (countGpuAdapters). winsock2.h is
 // already pulled in above via IXNetSystem.h, which defines _WINSOCKAPI_, so a later <windows.h>
@@ -2704,6 +2706,427 @@ static bool run_gate_j()
 }
 
 // ---------------------------------------------------------------------------------------------
+// GATE K: the device-arrival self-heal path -- the devicesChanged diff + the stateless self-heal pass
+// -- asserted end to end with NO hardware. ControlVerbs exposes an injectable device-snapshot provider
+// (defaulting to the real type-only enumeration); the gate substitutes canned snapshots to drive the
+// diff and heal branches deterministically. Three properties:
+//   1. A first (baseline) snapshot emits NO devicesChanged; a following changed snapshot emits exactly
+//      one devicesChanged carrying the correct added/removed sets (added named from the new snapshot,
+//      removed named from the old).
+//   2. A frameless camera source whose saved device is present in the snapshot is FORCE-restarted -- a
+//      propertyChanged echo with applied=[video_device_id] fires (the forced-update path that bypasses
+//      the wire no-op guard).
+//   3. A camera whose device is ABSENT, and a disabled camera whose device is present, are left
+//      untouched (no echo).
+//   4. ARRIVAL branch: a camera saved to a device that is ABSENT at baseline is not healed; when that
+//      device later appears (transitions absent->present, landing in the arrival set) the heal fires
+//      exactly once. Headless sources are width/height 0 either way, so the width==0 proxy would also
+//      trigger here -- the stale-nonzero-dimensions case that makes the arrival branch STRICTLY
+//      necessary is only reachable with real hardware. This asserts the arrival-set plumbing.
+//   5. HEAL DISCIPLINE (RC3): three rapid refreshes over an UNCHANGED snapshot heal a frameless source on
+//      the FIRST pass only -- the >= 10 s monotonic cooldown suppresses passes 2-3 (propertyChanged == 1).
+//      Then removing and RE-ADDING the saved device (an immediate second arrival after a FRUITLESS first
+//      heal) is ALSO suppressed: the arrival rate limit fires only when (never attempted) OR (frames seen
+//      since the last attempt) OR (cooldown elapsed), and none holds -- a flapping device degrades to one
+//      restart per cooldown window. The frames-seen-since-last-attempt branch (a legit replug healing
+//      INSTANTLY because the source produced frames before the unplug) needs nonzero source dimensions
+//      and is therefore hardware-only; property 4 covers the never-attempted arrival branch.
+//   6. PRODUCTIVE-OWNER guard (RC3, stateless branch only): plumbing-exercised only. Two frameless
+//      sibling sources on the SAME device both heal on the stateless pass (the sibling scan finds no
+//      productive owner among frameless recs). The POSITIVE suppression -- a sibling reporting NONZERO
+//      dimensions -- and the F3 arrival-skips-guard fix (two STALE-nonzero prior owners must not mutually
+//      suppress each other's arrival heals) both require nonzero source dimensions, which cannot be
+//      produced headlessly; the steal-prevention and mutual-suppression cases are verified MANUALLY on
+//      hardware. The gate asserts only that the stateless-branch scan path runs without suppressing.
+// The real replug wiring (cfgmgr32 notification -> debounce -> this pass) is verified MANUALLY on
+// hardware; this gate covers the snapshot/diff/heal logic that wiring drives.
+// ---------------------------------------------------------------------------------------------
+static bool run_gate_k()
+{
+	using moxrelay::ControlVerbs;
+	using moxrelay::InstanceIdentity;
+	using moxrelay::SpoutNaming;
+	using moxrelay::SpoutSenderEngine;
+	using nlohmann::json;
+
+	bool pass = false;
+	SpoutSenderEngine engine;
+	moxrelay::AudioMixEngine audio;
+	do {
+		if (!engine.start())
+			break;
+		audio.setTestSink([](const float *, size_t) {});
+		if (!audio.start())
+			break;
+
+		InstanceIdentity identity;
+		identity.instanceId = "selftest";
+		identity.fpsTier = 60;
+		identity.version = moxrelay::kMoxRelayVersion;
+		identity.machine = SpoutNaming::localMachineName();
+
+		// Recorded event stream (name -> flat data payload -- emitEvent merges instanceId/ts into the
+		// data object before the sink sees it, so there is no {event,data} wrapper here).
+		std::vector<std::pair<std::string, json>> events;
+		auto sink = [&events](const std::string &name, const json &data) {
+			events.push_back({name, data});
+		};
+		auto clearEvents = [&events] { events.clear(); };
+		auto countEvent = [&events](const char *name) {
+			int n = 0;
+			for (const auto &e : events)
+				if (e.first == name)
+					++n;
+			return n;
+		};
+		auto findEvent = [&events](const char *name) -> const json * {
+			for (const auto &e : events)
+				if (e.first == name)
+					return &e.second;
+			return nullptr;
+		};
+
+		// --- Property 1: baseline emits nothing; a changed snapshot emits one correct devicesChanged.
+		{
+			ControlVerbs verbs(&engine, &audio, identity);
+			verbs.adoptBootSources({}, /*attachedInOrder=*/false);
+			verbs.setEventSink(sink);
+
+			// Baseline snapshot A -- the first refresh must NOT emit devicesChanged (no reference yet).
+			verbs.setDeviceSnapshotProvider([] {
+				return ControlVerbs::DeviceSnapshot{{"dev_a", "Cam A"}, {"dev_b", "Cam B"}};
+			});
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			if (countEvent("devicesChanged") != 0) {
+				std::printf("  gate-k: baseline emitted devicesChanged (want none)\n");
+				break;
+			}
+
+			// Snapshot B: dev_a removed, dev_c added; dev_b unchanged.
+			verbs.setDeviceSnapshotProvider([] {
+				return ControlVerbs::DeviceSnapshot{{"dev_b", "Cam B"}, {"dev_c", "Cam C"}};
+			});
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			const json *dc = findEvent("devicesChanged");
+			const bool diffOk =
+				dc && countEvent("devicesChanged") == 1 && dc->at("added").size() == 1 &&
+				dc->at("removed").size() == 1 &&
+				dc->at("added")[0].value("id", std::string()) == "dev_c" &&
+				dc->at("added")[0].value("name", std::string()) == "Cam C" &&
+				dc->at("removed")[0].value("id", std::string()) == "dev_a" &&
+				dc->at("removed")[0].value("name", std::string()) == "Cam A";
+			std::printf("  gate-k: devicesChanged diff %s\n", diffOk ? "ok" : "FAIL");
+			if (!diffOk)
+				break;
+
+			// Empty-enumeration guard: a transient EMPTY snapshot (the mid-replug driver-reset
+			// moment) must neither emit a FALSE remove-all devicesChanged nor clobber the stored
+			// baseline (which would make the next real snapshot a FALSE add-all).
+			verbs.setDeviceSnapshotProvider([] { return ControlVerbs::DeviceSnapshot{}; });
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			const bool emptyQuiet = countEvent("devicesChanged") == 0;
+			// The baseline must have SURVIVED the empty pass: re-injecting the same pre-empty set
+			// emits nothing (a clobbered baseline would emit a false added=[everything]).
+			verbs.setDeviceSnapshotProvider([] {
+				return ControlVerbs::DeviceSnapshot{{"dev_b", "Cam B"}, {"dev_c", "Cam C"}};
+			});
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			const bool baselineSurvived = countEvent("devicesChanged") == 0;
+			std::printf("  gate-k: empty-enumeration guard %s (quiet=%d survived=%d)\n",
+				    (emptyQuiet && baselineSurvived) ? "ok" : "FAIL", emptyQuiet ? 1 : 0,
+				    baselineSurvived ? 1 : 0);
+			if (!emptyQuiet || !baselineSurvived)
+				break;
+		}
+
+		// --- Property 2 + 3: the self-heal pass. A fresh instance so the FIRST snapshot is the baseline
+		// (no devicesChanged) and the ONLY echoes come from the heal pass itself.
+		{
+			ControlVerbs verbs(&engine, &audio, identity);
+			verbs.adoptBootSources({}, /*attachedInOrder=*/false);
+			verbs.setEventSink(sink);
+
+			// Three camera sources. dshow_input (wire "camera") is registered when win-dshow loads.
+			const json ca = verbs.guiCreateSource("camera", "HealMe");      // device present -> heal
+			const json cb = verbs.guiCreateSource("camera", "WrongDevice"); // device absent  -> skip
+			const json cc = verbs.guiCreateSource("camera", "Disabled");    // present+disabled -> skip
+			if (!ca.contains("result") || !cb.contains("result") || !cc.contains("result")) {
+				std::printf("  gate-k: camera source create failed (dshow_input unavailable?)\n");
+				break;
+			}
+			const std::string idA = ca["result"].value("sourceId", std::string());
+			const std::string idB = cb["result"].value("sourceId", std::string());
+			const std::string idC = cc["result"].value("sourceId", std::string());
+
+			// Assign bogus device ids (no hardware -> capture stays frameless, width/height == 0).
+			verbs.guiSetSourceProperties(idA, json{{"video_device_id", "present_dev"}});
+			verbs.guiSetSourceProperties(idB, json{{"video_device_id", "absent_dev"}});
+			verbs.guiSetSourceProperties(idC, json{{"video_device_id", "present_dev"}});
+			// Hard-disable camera C so deviceShouldShow() is false (a should-be-dark source is skipped).
+			verbs.dispatch(json(0), "SetSourceIdleMode",
+				       json{{"sourceId", idC}, {"releaseWhenIdle", false}, {"disabled", true}});
+
+			// Baseline snapshot contains ONLY present_dev: heal pass runs (baseline heals too) but emits
+			// NO devicesChanged. Camera A heals; B (absent device) and C (disabled) do not.
+			verbs.setDeviceSnapshotProvider([] {
+				return ControlVerbs::DeviceSnapshot{{"present_dev", "Present Cam"}};
+			});
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+
+			const json *echo = findEvent("propertyChanged");
+			const int pc = countEvent("propertyChanged");
+			const bool healOk =
+				pc == 1 && countEvent("devicesChanged") == 0 && echo &&
+				echo->value("sourceId", std::string()) == idA && echo->contains("applied") &&
+				echo->at("applied").contains("video_device_id");
+			std::printf("  gate-k: self-heal forced-restart echo %s (propertyChanged=%d)\n",
+				    healOk ? "ok" : "FAIL", pc);
+			if (!healOk)
+				break;
+		}
+
+		// --- Property 4: the ARRIVAL branch of the heal predicate. A camera saved to dev_c that is ABSENT
+		// at baseline is NOT healed; when dev_c later appears (landing in the arrival set) the heal fires
+		// exactly once. HONEST NOTE: headless sources are width/height 0 regardless, so here the width==0
+		// proxy would ALSO trigger the heal -- the stale-nonzero-dimensions case that makes the arrival
+		// branch strictly necessary (a hot-unplugged win-dshow source keeps its last frame size) is only
+		// reachable with REAL hardware. This asserts the arrival-set plumbing: captured before the
+		// snapshot swap + the emitEvent move, consulted by the heal, and empty on the baseline pass.
+		{
+			ControlVerbs verbs(&engine, &audio, identity);
+			verbs.adoptBootSources({}, /*attachedInOrder=*/false);
+			verbs.setEventSink(sink);
+
+			const json cd = verbs.guiCreateSource("camera", "ArrivesLater");
+			if (!cd.contains("result")) {
+				std::printf("  gate-k: arrival-source create failed (dshow_input unavailable?)\n");
+				break;
+			}
+			const std::string idD = cd["result"].value("sourceId", std::string());
+			verbs.guiSetSourceProperties(idD, json{{"video_device_id", "dev_c"}});
+
+			// Baseline snapshot {dev_b}: dev_c absent -> the heal must SKIP the source (no echo at all).
+			verbs.setDeviceSnapshotProvider(
+				[] { return ControlVerbs::DeviceSnapshot{{"dev_b", "Cam B"}}; });
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			const bool baselineNoHeal =
+				countEvent("propertyChanged") == 0 && countEvent("devicesChanged") == 0;
+
+			// dev_c arrives: {dev_b, dev_c}. It lands in the arrival set; the source heals exactly once.
+			verbs.setDeviceSnapshotProvider([] {
+				return ControlVerbs::DeviceSnapshot{{"dev_b", "Cam B"}, {"dev_c", "Cam C"}};
+			});
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			const json *aEcho = findEvent("propertyChanged");
+			const int apc = countEvent("propertyChanged");
+			const bool arrivalHealOk = apc == 1 && aEcho &&
+						   aEcho->value("sourceId", std::string()) == idD &&
+						   aEcho->contains("applied") &&
+						   aEcho->at("applied").contains("video_device_id");
+			std::printf("  gate-k: arrival-branch heal %s (baselineNoHeal=%d propertyChanged=%d)\n",
+				    (baselineNoHeal && arrivalHealOk) ? "ok" : "FAIL", baselineNoHeal ? 1 : 0,
+				    apc);
+			if (!baselineNoHeal || !arrivalHealOk)
+				break;
+		}
+
+		// --- Property 5: heal discipline. Rapid unchanged refreshes heal ONCE (cooldown gates the rest);
+		// an immediate remove+re-add after that FRUITLESS heal is ALSO suppressed (the arrival rate
+		// limit: no frames since the last attempt AND inside the cooldown window -> one restart per
+		// window, not one per flap). The frames-seen branch that lets a legit replug heal instantly is
+		// hardware-only (needs nonzero dims); the never-attempted branch is property 4.
+		{
+			ControlVerbs verbs(&engine, &audio, identity);
+			verbs.adoptBootSources({}, /*attachedInOrder=*/false);
+			verbs.setEventSink(sink);
+
+			const json ce = verbs.guiCreateSource("camera", "Flapper");
+			if (!ce.contains("result")) {
+				std::printf("  gate-k: discipline-source create failed (dshow_input unavailable?)\n");
+				break;
+			}
+			const std::string idE = ce["result"].value("sourceId", std::string());
+			verbs.guiSetSourceProperties(idE, json{{"video_device_id", "cool_dev"}});
+
+			auto coolSnap = [] { return ControlVerbs::DeviceSnapshot{{"cool_dev", "Cool Cam"}}; };
+
+			// Three rapid refreshes over the SAME snapshot: pass 1 heals (baseline, frameless); passes
+			// 2-3 fall inside the >= 10 s cooldown window -> suppressed. Exactly one propertyChanged.
+			verbs.setDeviceSnapshotProvider(coolSnap);
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			verbs.refreshDeviceSnapshotAndHeal();
+			verbs.refreshDeviceSnapshotAndHeal();
+			const int rapidPc = countEvent("propertyChanged");
+			const bool cooldownOk = rapidPc == 1;
+			std::printf("  gate-k: cooldown gates rapid reheals %s (propertyChanged=%d, want 1)\n",
+				    cooldownOk ? "ok" : "FAIL", rapidPc);
+			if (!cooldownOk)
+				break;
+
+			// Remove the saved device (heal skips -- device absent), then re-add it IMMEDIATELY: the
+			// absent->present transition is an arrival, but the first heal above was FRUITLESS (headless
+			// source, no frames since) and the cooldown is still warm, so the arrival rate limit
+			// suppresses it -- NO second echo. (Had the source produced frames since the last attempt,
+			// or the cooldown elapsed, this arrival would heal instantly -- hardware-only here.)
+			verbs.setDeviceSnapshotProvider(
+				[] { return ControlVerbs::DeviceSnapshot{{"other_dev", "Other Cam"}}; });
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			const bool removedQuiet = countEvent("propertyChanged") == 0;
+			verbs.setDeviceSnapshotProvider(coolSnap);
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			const int readdPc = countEvent("propertyChanged");
+			const bool flapSuppressedOk = removedQuiet && readdPc == 0;
+			std::printf("  gate-k: fruitless re-arrival suppressed %s (removedQuiet=%d readd propertyChanged=%d, want 0)\n",
+				    flapSuppressedOk ? "ok" : "FAIL", removedQuiet ? 1 : 0, readdPc);
+			if (!flapSuppressedOk)
+				break;
+		}
+
+		// --- Property 6: productive-owner guard, plumbing-exercised. Two frameless siblings on the SAME
+		// present device both heal on the baseline pass -- the sibling scan finds no productive owner among
+		// frameless recs, so it does not suppress. Positive suppression (a sibling with NONZERO dimensions)
+		// needs a real capturing device and is verified MANUALLY on hardware.
+		{
+			ControlVerbs verbs(&engine, &audio, identity);
+			verbs.adoptBootSources({}, /*attachedInOrder=*/false);
+			verbs.setEventSink(sink);
+
+			const json cf = verbs.guiCreateSource("camera", "SiblingOne");
+			const json cg = verbs.guiCreateSource("camera", "SiblingTwo");
+			if (!cf.contains("result") || !cg.contains("result")) {
+				std::printf("  gate-k: sibling-source create failed (dshow_input unavailable?)\n");
+				break;
+			}
+			verbs.guiSetSourceProperties(cf["result"].value("sourceId", std::string()),
+						     json{{"video_device_id", "shared_dev"}});
+			verbs.guiSetSourceProperties(cg["result"].value("sourceId", std::string()),
+						     json{{"video_device_id", "shared_dev"}});
+
+			verbs.setDeviceSnapshotProvider(
+				[] { return ControlVerbs::DeviceSnapshot{{"shared_dev", "Shared Cam"}}; });
+			clearEvents();
+			verbs.refreshDeviceSnapshotAndHeal();
+			const int sibPc = countEvent("propertyChanged");
+			const bool siblingScanOk = sibPc == 2; // both heal: no productive owner among frameless siblings
+			std::printf("  gate-k: productive-owner guard scan (plumbing) %s (propertyChanged=%d, want 2; "
+				    "positive suppression needs hardware)\n",
+				    siblingScanOk ? "ok" : "FAIL", sibPc);
+			if (!siblingScanOk)
+				break;
+		}
+
+		pass = true;
+	} while (false);
+
+	engine.stop();
+	engine.stop(); // idempotence assertion, the engine-gate convention
+	audio.stop();
+	std::printf("GATE K (device-arrival self-heal): %s\n", pass ? "PASS" : "FAIL");
+	std::fflush(stdout);
+	return pass;
+}
+
+// ---------------------------------------------------------------------------------------------
+// GATE L: sender-name stickiness + truncation safety, asserted at the ALLOCATOR level (headless --
+// pure shared-memory registry probes + the local reservation set; no engine, no GPU, no sources).
+// Rationale under test: name stability across broadcast cycles is a correctness property for ANY
+// name-keyed consumer -- a receiver bound to a published name must never observe that name
+// re-issued to a different source while the original still exists. Four properties:
+//   1. STICKY re-attach: a resolved name passed back as `sticky` returns UNCHANGED and takes no
+//      new reservation (the record kept its reservation across a broadcast detach -- detach no
+//      longer releases).
+//   2. Collision suffixing: two identical requested names resolve to base and base_2.
+//   3. DARK-holder reservation: after the base holder detaches (NO release -- the sticky
+//      contract), a third identical request resolves to base_3; the base stays reserved by the
+//      dark holder, so its name can never be handed to a sibling while it exists.
+//   4. TRUNCATE-then-uniquify: two over-cap names that truncate equal resolve to DISTINCT names,
+//      both within the registry cap (the suffix never pushes a candidate past it).
+//   5. ADOPTION SYNC (registration-time divergence): rebind() moves the reservation to the name
+//      the registry actually published (a lost external race auto-suffixes) -- the old name
+//      returns to the pool and the adopted name is the one a sticky re-attach reuses, so the
+//      sticky name is always the PUBLISHED name. (The engine-side trigger -- a live sender whose
+//      registered name diverges -- needs a real cross-process collision; the bookkeeping move it
+//      performs is what this asserts.)
+// ---------------------------------------------------------------------------------------------
+static bool run_gate_l()
+{
+	using moxrelay::SenderNameAllocator;
+	using moxrelay::SpoutNaming;
+
+	SenderNameAllocator alloc;
+	const std::string machine = SpoutNaming::localMachineName();
+	constexpr int port = 7349; // selftest-only port so bases cannot collide with a live instance
+
+	bool pass = false;
+	do {
+		// 1. Sticky re-attach: same name back, reservation count unchanged.
+		const std::string a1 = alloc.resolve(machine, port, "StickyAlpha");
+		const size_t afterFirst = alloc.reservedCount();
+		const std::string a2 = alloc.resolve(machine, port, "StickyAlpha", /*sticky=*/a1);
+		const bool stickyOk = !a1.empty() && a2 == a1 && alloc.reservedCount() == afterFirst;
+		std::printf("  gate-l: sticky re-attach same name %s ('%s')\n", stickyOk ? "ok" : "FAIL",
+			    a1.c_str());
+		if (!stickyOk)
+			break;
+
+		// 2 + 3. base/_2; then _3 while the base holder is DARK (detached, not removed): no release
+		// happened between b1 and b3 -- that absence IS the sticky pool semantics under test.
+		const std::string b1 = alloc.resolve(machine, port, "StickyBravo");
+		const std::string b2 = alloc.resolve(machine, port, "StickyBravo");
+		const std::string b3 = alloc.resolve(machine, port, "StickyBravo");
+		const bool suffixOk = !b1.empty() && b2 == b1 + "_2" && b3 == b1 + "_3";
+		std::printf("  gate-l: base/_2 then _3 with dark base holder %s ('%s'/'%s'/'%s')\n",
+			    suffixOk ? "ok" : "FAIL", b1.c_str(), b2.c_str(), b3.c_str());
+		if (!suffixOk)
+			break;
+
+		// 4. Truncation collision: identical up to (and past) the cap budget -> truncate equal,
+		// uniquify apart, both within the registry cap (SpoutMaxSenderNameLen - 1 storable chars).
+		const std::string longA(300, 'x');
+		const std::string longB = longA + "-differs-only-past-the-cap";
+		const std::string t1 = alloc.resolve(machine, port, longA);
+		const std::string t2 = alloc.resolve(machine, port, longB);
+		constexpr size_t cap = 255; // vendored registry buffer is char[256] incl. terminator
+		const bool truncOk = !t1.empty() && !t2.empty() && t1 != t2 && t1.size() <= cap &&
+				     t2.size() <= cap && t2 == t1 + "_2";
+		std::printf("  gate-l: truncate-then-uniquify %s (len %zu/%zu, cap %zu)\n",
+			    truncOk ? "ok" : "FAIL", t1.size(), t2.size(), cap);
+		if (!truncOk)
+			break;
+
+		// 5. Adoption sync: rebind moves the reservation to the published name. Afterwards the
+		// OLD name is free again (a fresh identical request gets the base back) and the ADOPTED
+		// name answers a sticky re-attach -- the sticky name IS the published name.
+		const std::string c1 = alloc.resolve(machine, port, "StickyCharlie");
+		const std::string adopted = c1 + "_1"; // what a lost external race would register
+		alloc.rebind(c1, adopted);
+		const std::string c2 = alloc.resolve(machine, port, "StickyCharlie"); // base free again
+		const std::string c3 = alloc.resolve(machine, port, "StickyCharlie", /*sticky=*/adopted);
+		const bool adoptOk = !c1.empty() && c2 == c1 && c3 == adopted;
+		std::printf("  gate-l: adoption rebind moves reservation %s ('%s' -> '%s', refill '%s')\n",
+			    adoptOk ? "ok" : "FAIL", c1.c_str(), adopted.c_str(), c2.c_str());
+		if (!adoptOk)
+			break;
+
+		pass = true;
+	} while (false);
+
+	std::printf("GATE L (sender-name stickiness): %s\n", pass ? "PASS" : "FAIL");
+	std::fflush(stdout);
+	return pass;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Headless self-test path (print/exit contract UNCHANGED: gates print "GATE X (desc): PASS|FAIL",
 // AND into ok; exit 0=pass / 1=gate fail / 2=boot fail; no window, no event loop). Gates C/D/E
 // are the ADDITIVE M2.1/M2.2/M2.3 gates; the design-hook sample prints remain additive as before.
@@ -2793,6 +3216,8 @@ static int run_selftest(int argc, char **argv, const moxrelay::CliOptions &optio
 		std::printf("GATE H (servo/trim scenarios): FAIL\n");
 		std::printf("GATE I (control-port auto-fallback): FAIL\n");
 		std::printf("GATE J (profile save/load round-trip): FAIL\n");
+		std::printf("GATE K (device-arrival self-heal): FAIL\n");
+		std::printf("GATE L (sender-name stickiness): FAIL\n");
 		std::printf("SELFTEST: FAIL (libobs failed to start)\n");
 		std::fflush(stdout);
 		moxrelay::ObsBootstrap::shutdown();
@@ -2896,6 +3321,25 @@ static int run_selftest(int argc, char **argv, const moxrelay::CliOptions &optio
 		std::fflush(stdout);
 	}
 
+	// GATE K: the device-arrival self-heal path -- the devicesChanged diff + the stateless self-heal
+	// pass, driven through an injected device-snapshot provider (no hardware required).
+	bool gateK = true;
+	if (sel("k")) {
+		gateK = run_gate_k();
+	} else {
+		std::printf("GATE K (device-arrival self-heal): SKIP\n");
+		std::fflush(stdout);
+	}
+
+	// GATE L: sender-name stickiness + truncation safety (allocator-level, headless).
+	bool gateL = true;
+	if (sel("l")) {
+		gateL = run_gate_l();
+	} else {
+		std::printf("GATE L (sender-name stickiness): SKIP\n");
+		std::fflush(stdout);
+	}
+
 	// ADDITIVE: the published-settings-key audit (contract vocabulary hygiene; printed, not
 	// gated -- a flag means a key gets renamed through the TypeVocabulary overlay).
 	if (selAll)
@@ -2907,7 +3351,7 @@ static int run_selftest(int argc, char **argv, const moxrelay::CliOptions &optio
 	moxrelay::ObsBootstrap::shutdown();
 
 	const bool ok = r.gateA && r.gateB && gateC && gateD && gateD2 && gateE && gateF && gateG &&
-			gateH && gateI && gateJ;
+			gateH && gateI && gateJ && gateK && gateL;
 	std::printf("SELFTEST: %s\n", ok ? "PASS" : "FAIL");
 	std::fflush(stdout);
 	return ok ? 0 : 1;
@@ -3204,6 +3648,16 @@ static int run_gui(int argc, char **argv, const moxrelay::CliOptions &options)
 	moxrelay::ParentWatch parentWatch;
 	if (managed && options.ownerPid > 0)
 		parentWatch.start(static_cast<unsigned long>(options.ownerPid));
+
+	// Automatic source recovery on video-capture device arrival. An OS device-interface notification
+	// (debounced) -- plus a one-shot post-start baseline -- pokes a MAIN-THREAD pass that re-enumerates
+	// the present devices, emits devicesChanged on a diff, and force-restarts any frameless-but-should-
+	// be-live camera source whose saved device is now present (the standard propertyChanged echo then
+	// updates every client). Declared at run_gui body scope (like parentWatch) so it spans app.exec();
+	// its dtor unregisters the OS notification -- draining callbacks -- at scope exit, AFTER app.exec()
+	// has returned, so no queued poke can touch the verb layer during teardown.
+	moxrelay::DeviceArrivalWatch deviceWatch;
+	deviceWatch.start([&verbs] { verbs.refreshDeviceSnapshotAndHeal(); });
 
 	int rc = 0;
 	{

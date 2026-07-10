@@ -127,12 +127,28 @@ public:
 	// memory). The sender itself is created lazily on the
 	// graphics thread at the next frame. Returns a slot id, or -1 (no source / no free name).
 	// `format` is fixed for the slot's lifetime (format change = detach + re-attach).
+	// `stickyName`: a previously resolved name the caller's record still owns (sticky-name
+	// contract; see SenderNameAllocator) -- when non-empty and still reserved, the slot publishes
+	// under the SAME name instead of resolving fresh, so a re-attach is name-stable.
 	int attach(obs_source_t *source, const std::string &machine, int port, const std::string &sourceName,
-		   SenderFormat format = SenderFormat::Srgb87);
+		   SenderFormat format = SenderFormat::Srgb87, const std::string &stickyName = std::string());
 
 	// Detach one slot: GPU teardown is marshalled to the graphics thread (blocking), then the
 	// source ref is released. Safe while frames are in flight. No-op on an unknown/dead id.
+	// The slot's name reservation is intentionally KEPT (sticky-name contract): the caller's
+	// record owns it across broadcast cycles and releases it via releaseSenderName() only when
+	// the record itself goes away. stop() (shutdown) still releases everything it tears down.
 	void detach(int slotId);
+
+	// Sticky-name lifecycle: drop a name reservation a source record owns. The ONLY per-source
+	// release site (record removal / instance teardown) -- broadcast detach never releases.
+	// Safe no-op on empty/unknown names.
+	void releaseSenderName(const std::string &resolvedName);
+
+	// The pre-resolved (reserved) sender name of a live slot ("" on unknown/dead/audio-only
+	// slots). Callers store it as the record's sticky name right after attach() so a later
+	// re-attach can reuse it.
+	std::string slotResolvedName(int slotId);
 
 	// Count of live (attached, not init-failed) slots.
 	size_t activeCount();
