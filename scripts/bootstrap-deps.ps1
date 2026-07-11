@@ -56,7 +56,7 @@ $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------------------------
 # PINNED upstream revisions. These are the single source of truth for this script and MUST stay
-# in lock-step with packaging/SOURCES.txt and obs-studio's own CMakePresets.json vendor block.
+# in lock-step with packaging/SOURCES.txt.in and obs-studio's own CMakePresets.json vendor block.
 #
 #   obs-studio : tag 32.1.2  (commit below) -- supplies libobs headers, obs.lib/obs.dll, plugins.
 #   obs-deps   : 2025-08-23  -- the prebuilt FFmpeg/x264/curl/... bundle (obs-deps-2025-08-23-x64)
@@ -204,7 +204,7 @@ foreach ($r in $required) {
 }
 if ($missing.Count -gt 0) {
     Fail ("Required obs-studio artifacts are missing:`n" + ($missing -join "`n") +
-          "`nIf obs-deps did not land as '$ObsDepsDate', the pinned obs-studio tag may have changed its dependency pin -- reconcile this script, packaging/SOURCES.txt, and obs-studio's CMakePresets.json before continuing.")
+          "`nIf obs-deps did not land as '$ObsDepsDate', the pinned obs-studio tag may have changed its dependency pin -- reconcile this script, packaging/SOURCES.txt.in, and obs-studio's CMakePresets.json before continuing.")
 }
 Write-Host "  All required artifacts present." -ForegroundColor Green
 

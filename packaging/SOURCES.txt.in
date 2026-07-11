@@ -3,8 +3,11 @@ CORRESPONDING SOURCE / WRITTEN OFFER (GNU GPL)
 ===============================================================================
 
 RELEASE-PINNED DOCUMENT: the component versions/commits/build identifiers below
-correspond to THIS exact build (0.21.0-m15). They must be regenerated/updated on
-every release so the pinned source always matches the binary being shipped.
+correspond to THIS exact build (@MOXRELAY_VERSION_FULL@). The application
+version in this file is stamped automatically at build time from the same
+single source of truth the binary reports, so it always matches the build; the
+third-party component pins below are updated whenever a bundled component
+changes.
 
 This software is licensed under the GNU General Public License, version 3 or
 (at your option) any later version. The full text of that license is the
@@ -21,11 +24,12 @@ available, at no charge, from a network server:
 
     https://github.com/ToxMox/MoxRelay
 
-at the tag/release matching this build's version (0.21.0-m15). Equivalent
-access to the source is offered from this same public location as the binary
-itself, which satisfies GPLv3 section 6(d). That repository, together with the
-upstream per-component sources pinned in the list below, constitutes the
-complete corresponding source for the GPL/LGPL portions of this binary.
+at the tag/release matching this build's version (@MOXRELAY_VERSION_FULL@).
+Equivalent access to the source is offered from this same public location as
+the binary itself, which satisfies GPLv3 section 6(d). That repository,
+together with the upstream per-component sources pinned in the list below,
+constitutes the complete corresponding source for the GPL/LGPL portions of
+this binary.
 
 A full per-component license index, including the components that are NOT
 under the GPL, is in THIRD-PARTY-NOTICES.txt (next to this file), with the
@@ -42,7 +46,7 @@ portions of this binary.
 
 1. This application
    License : GPLv3-or-later (see the root LICENSE file)
-   Version : 0.21.0-m15   (matches this package's version / zip file name)
+   Version : @MOXRELAY_VERSION_FULL@   (matches this package's version / zip file name)
    Source  : https://github.com/ToxMox/MoxRelay
              The public source repository at the release tag matching the
              version above IS the corresponding source for this application.
@@ -103,5 +107,5 @@ the corresponding source, open an issue at:
 
     https://github.com/ToxMox/MoxRelay/issues
 
-When making a request, please reference the version (0.21.0-m15) and the
-specific component(s) whose source you require.
+When making a request, please reference the version (@MOXRELAY_VERSION_FULL@)
+and the specific component(s) whose source you require.

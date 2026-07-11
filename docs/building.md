@@ -47,7 +47,8 @@ The bootstrap is fully pinned and reproducible:
 The obs-deps and Qt6 versions are **pinned inside obs-studio@32.1.2's own `CMakePresets.json`**
 (with SHA-256 hashes), so checking out the pinned obs-studio commit pins the dependency bundles
 too. The same revisions are recorded for GPL corresponding-source compliance in
-`packaging/SOURCES.txt`.
+`packaging/SOURCES.txt.in` (the template CMake stamps with the build version at configure
+time to produce the shipped `SOURCES.txt`).
 
 ## Prerequisites
 

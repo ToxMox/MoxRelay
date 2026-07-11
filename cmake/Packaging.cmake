@@ -17,6 +17,10 @@
 #
 # This module ships the BINARIES + the root LICENSE/README + the GPL/third-party compliance set
 # (SOURCES.txt corresponding-source offer, THIRD-PARTY-NOTICES.txt index, and licenses/ texts).
+# SOURCES.txt is GENERATED at configure time from packaging/SOURCES.txt.in (rule 6a below): the
+# app-version lines are stamped from MOXRELAY_VERSION_FULL so the shipped offer can never drift
+# from the built version. Only the .in template exists in the source tree -- there is no static
+# SOURCES.txt to go stale.
 #
 # ---- Produce the zip (from a VS dev shell) ----
 #   cmake --preset msvc-x64                 # configure (real paths come from CMakeUserPresets.json)
@@ -103,11 +107,25 @@ install(FILES
 #    build + x264) and redistributes third-party binaries, so the package must ship
 #    the corresponding-source written offer + a third-party license index + the
 #    per-component license texts.
-#      a. SOURCES.txt (GPL written offer) + THIRD-PARTY-NOTICES.txt (license index) -> ROOT.
+#      a. SOURCES.txt (GPL written offer): STAMPED at configure time from packaging/SOURCES.txt.in.
+#         configure_file(@ONLY) substitutes @MOXRELAY_VERSION_FULL@ (the full kMoxRelayVersion
+#         string incl. any -m<n> suffix, parsed from HelperConfig.hpp in CMakeLists.txt) into the
+#         app-version lines, then the GENERATED file installs to the package ROOT. The pinned
+#         third-party revisions in the template (obs/obs-deps/FFmpeg/x264) stay hand-maintained.
+#         The template is the only copy in the source tree, so a stale unstamped SOURCES.txt
+#         cannot ship. THIRD-PARTY-NOTICES.txt (license index) -> ROOT, verbatim.
 #      b. the per-component verbatim license texts -> licenses/  (the trailing "/" on the
 #         source copies the CONTENTS of packaging/licenses into the package's licenses/).
+if(NOT MOXRELAY_VERSION_FULL)
+	message(FATAL_ERROR "MOXRELAY_VERSION_FULL is not set; Packaging.cmake must be included after the version block in CMakeLists.txt")
+endif()
+configure_file(
+	"${CMAKE_SOURCE_DIR}/packaging/SOURCES.txt.in"
+	"${CMAKE_BINARY_DIR}/packaging/SOURCES.txt"
+	@ONLY)
+
 install(FILES
-	"${CMAKE_SOURCE_DIR}/packaging/SOURCES.txt"
+	"${CMAKE_BINARY_DIR}/packaging/SOURCES.txt"
 	"${CMAKE_SOURCE_DIR}/packaging/THIRD-PARTY-NOTICES.txt"
 	DESTINATION .)
 

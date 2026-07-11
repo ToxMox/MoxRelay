@@ -15,7 +15,8 @@ cmake_minimum_required(VERSION 3.28)
 # Version: SINGLE SOURCE OF TRUTH = kMoxRelayVersion in src/app/HelperConfig.hpp (the version the
 # running exe publishes). Derived here at configure time so the build/package version can NEVER drift
 # from what the binary reports -- do NOT hardcode a version number anywhere; bump kMoxRelayVersion and
-# everything (project(), CPACK_PACKAGE_VERSION, the zip filename) follows.
+# everything (project(), CPACK_PACKAGE_VERSION, the zip filename, the stamped packaging SOURCES.txt)
+# follows.
 #   MOXRELAY_VERSION_FULL    -- full string incl. any pre-release suffix (e.g. "X.Y.Z-mN"); used for the zip FILENAME.
 #   MOXRELAY_VERSION_NUMERIC -- numeric MAJOR.MINOR.PATCH core; project()/CPack require numeric here.
 # Read BEFORE project() so the numeric core can feed project(... VERSION ...).
